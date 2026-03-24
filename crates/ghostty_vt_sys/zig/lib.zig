@@ -3,6 +3,7 @@ const ghostty_input = @import("ghostty_src/input.zig");
 const terminal = @import("ghostty_src/terminal/main.zig");
 
 const Allocator = std.mem.Allocator;
+const Action = terminal.StreamAction;
 
 const TerminalHandle = struct {
     alloc: Allocator,
@@ -38,8 +39,7 @@ const TerminalHandle = struct {
             .has_viewport_top_y_screen = true,
         };
         handle.handler.terminal = &handle.terminal;
-        handle.stream = terminal.Stream(*Handler).init(&handle.handler);
-        handle.stream.parser.osc_parser.alloc = alloc;
+        handle.stream = terminal.Stream(*Handler).initAlloc(alloc, &handle.handler);
         return handle;
     }
 
@@ -53,163 +53,118 @@ const TerminalHandle = struct {
 const Handler = struct {
     terminal: *terminal.Terminal,
 
-    pub fn print(self: *Handler, c: u21) !void {
-        try self.terminal.print(c);
-    }
+    pub fn deinit(_: *Handler) void {}
 
-    pub fn backspace(self: *Handler) !void {
-        self.terminal.backspace();
-    }
-
-    pub fn horizontalTab(self: *Handler, count: u16) !void {
-        for (0..@as(usize, count)) |_| {
-            try self.terminal.horizontalTab();
-        }
-    }
-
-    pub fn linefeed(self: *Handler) !void {
-        try self.terminal.linefeed();
-    }
-
-    pub fn carriageReturn(self: *Handler) !void {
-        self.terminal.carriageReturn();
-    }
-
-    pub fn setAttribute(self: *Handler, attr: terminal.Attribute) !void {
-        try self.terminal.setAttribute(attr);
-    }
-
-    pub fn invokeCharset(
+    pub fn vt(
         self: *Handler,
-        active: terminal.CharsetActiveSlot,
-        slot: terminal.CharsetSlot,
-        single: bool,
+        comptime action: Action.Tag,
+        value: Action.Value(action),
     ) !void {
-        self.terminal.invokeCharset(active, slot, single);
-    }
-
-    pub fn configureCharset(self: *Handler, slot: terminal.CharsetSlot, set: terminal.Charset) !void {
-        self.terminal.configureCharset(slot, set);
-    }
-
-    pub fn handleColorOperation(
-        self: *Handler,
-        op: terminal.osc.color.Operation,
-        requests: *const terminal.osc.color.List,
-        terminator: terminal.osc.Terminator,
-    ) !void {
-        _ = op;
-        _ = terminator;
-
-        if (requests.count() == 0) return;
-
-        var it = requests.constIterator(0);
-        while (it.next()) |req| {
-            switch (req.*) {
-                .set => |set| switch (set.target) {
-                    .palette => |i| {
-                        self.terminal.color_palette.colors[i] = set.color;
-                        self.terminal.color_palette.mask.set(i);
-                        self.terminal.flags.dirty.palette = true;
-                    },
+        const t = self.terminal;
+        switch (action) {
+            .print => try t.print(value.cp),
+            .backspace => t.backspace(),
+            .horizontal_tab => {
+                for (0..@as(usize, value)) |_| {
+                    t.horizontalTab();
+                }
+            },
+            .linefeed => try t.linefeed(),
+            .carriage_return => t.carriageReturn(),
+            .set_attribute => try t.setAttribute(value),
+            .invoke_charset => t.invokeCharset(value.bank, value.charset, value.locking),
+            .configure_charset => t.configureCharset(value.slot, value.charset),
+            .cursor_left => t.cursorLeft(value.value),
+            .cursor_right => t.cursorRight(value.value),
+            .cursor_down => {
+                t.cursorDown(value.value);
+            },
+            .cursor_up => {
+                t.cursorUp(value.value);
+            },
+            .cursor_col => t.setCursorPos(t.screens.active.cursor.y + 1, value.value),
+            .cursor_row => t.setCursorPos(value.value, t.screens.active.cursor.x + 1),
+            .cursor_pos => t.setCursorPos(value.row, value.col),
+            .erase_display_below => t.eraseDisplay(.below, value),
+            .erase_display_above => t.eraseDisplay(.above, value),
+            .erase_display_complete => t.eraseDisplay(.complete, value),
+            .erase_display_scrollback => t.eraseDisplay(.scrollback, value),
+            .erase_line_right => t.eraseLine(.right, value),
+            .erase_line_left => t.eraseLine(.left, value),
+            .erase_line_complete => t.eraseLine(.complete, value),
+            .start_hyperlink => try t.screens.active.startHyperlink(value.uri, value.id),
+            .end_hyperlink => t.screens.active.endHyperlink(),
+            .set_mode => {
+                const mode = value.mode;
+                t.modes.set(mode, true);
+                switch (mode) {
+                    .reverse_colors => t.flags.dirty.reverse_colors = true,
+                    .alt_screen_legacy => try t.switchScreenMode(.@"47", true),
+                    .alt_screen => try t.switchScreenMode(.@"1047", true),
+                    .alt_screen_save_cursor_clear_enter => try t.switchScreenMode(.@"1049", true),
                     else => {},
-                },
-                .reset => |target| switch (target) {
-                    .palette => |i| {
-                        self.terminal.color_palette.colors[i] = self.terminal.default_palette[i];
-                        self.terminal.color_palette.mask.unset(i);
-                        self.terminal.flags.dirty.palette = true;
-                    },
+                }
+            },
+            .reset_mode => {
+                const mode = value.mode;
+                t.modes.set(mode, false);
+                switch (mode) {
+                    .reverse_colors => t.flags.dirty.reverse_colors = true,
+                    .alt_screen_legacy => try t.switchScreenMode(.@"47", false),
+                    .alt_screen => try t.switchScreenMode(.@"1047", false),
+                    .alt_screen_save_cursor_clear_enter => try t.switchScreenMode(.@"1049", false),
                     else => {},
-                },
-                .reset_palette => {
-                    const mask = &self.terminal.color_palette.mask;
-                    var mask_iterator = mask.iterator(.{});
-                    while (mask_iterator.next()) |idx| {
-                        const i: usize = idx;
-                        self.terminal.color_palette.colors[i] = self.terminal.default_palette[i];
+                }
+            },
+            .color_operation => {
+                const requests = value.requests;
+                if (requests.count() == 0) return;
+
+                var it = requests.constIterator(0);
+                while (it.next()) |req| {
+                    switch (req.*) {
+                        .set => |set| switch (set.target) {
+                            .palette => |i| {
+                                t.colors.palette.current[i] = set.color;
+                                t.colors.palette.mask.set(i);
+                                t.flags.dirty.palette = true;
+                            },
+                            else => {},
+                        },
+                        .reset => |target| switch (target) {
+                            .palette => |i| {
+                                t.colors.palette.current[i] = t.colors.palette.original[i];
+                                t.colors.palette.mask.unset(i);
+                                t.flags.dirty.palette = true;
+                            },
+                            else => {},
+                        },
+                        .reset_palette => {
+                            const mask = &t.colors.palette.mask;
+                            var mask_iterator = mask.iterator(.{});
+                            while (mask_iterator.next()) |idx| {
+                                const i: usize = idx;
+                                t.colors.palette.current[i] = t.colors.palette.original[i];
+                            }
+                            t.colors.palette.mask = .initEmpty();
+                            t.flags.dirty.palette = true;
+                        },
+                        else => {},
                     }
-                    self.terminal.color_palette.mask = .initEmpty();
-                    self.terminal.flags.dirty.palette = true;
-                },
-                else => {},
-            }
-        }
-    }
-
-    pub fn setCursorLeft(self: *Handler, amount: u16) !void {
-        self.terminal.cursorLeft(amount);
-    }
-
-    pub fn setCursorRight(self: *Handler, amount: u16) !void {
-        self.terminal.cursorRight(amount);
-    }
-
-    pub fn setCursorDown(self: *Handler, amount: u16, carriage: bool) !void {
-        self.terminal.cursorDown(amount);
-        if (carriage) self.terminal.carriageReturn();
-    }
-
-    pub fn setCursorUp(self: *Handler, amount: u16, carriage: bool) !void {
-        self.terminal.cursorUp(amount);
-        if (carriage) self.terminal.carriageReturn();
-    }
-
-    pub fn setCursorCol(self: *Handler, col: u16) !void {
-        self.terminal.setCursorPos(self.terminal.screen.cursor.y + 1, col);
-    }
-
-    pub fn setCursorRow(self: *Handler, row: u16) !void {
-        self.terminal.setCursorPos(row, self.terminal.screen.cursor.x + 1);
-    }
-
-    pub fn setCursorPos(self: *Handler, row: u16, col: u16) !void {
-        self.terminal.setCursorPos(row, col);
-    }
-
-    pub fn eraseDisplay(self: *Handler, mode: terminal.EraseDisplay, protected: bool) !void {
-        self.terminal.eraseDisplay(mode, protected);
-    }
-
-    pub fn eraseLine(self: *Handler, mode: terminal.EraseLine, protected: bool) !void {
-        self.terminal.eraseLine(mode, protected);
-    }
-
-    pub fn startHyperlink(self: *Handler, uri: []const u8, id: ?[]const u8) !void {
-        try self.terminal.screen.startHyperlink(uri, id);
-    }
-
-    pub fn endHyperlink(self: *Handler) !void {
-        self.terminal.screen.endHyperlink();
-    }
-
-    pub fn setMode(self: *Handler, mode: terminal.Mode, enabled: bool) !void {
-        const prev = self.terminal.modes.get(mode);
-        self.terminal.modes.set(mode, enabled);
-
-        if (prev != enabled) {
-            switch (mode) {
-                .reverse_colors => self.terminal.flags.dirty.reverse_colors = true,
-                else => {},
-            }
-        }
-
-        switch (mode) {
-            .alt_screen_legacy => self.terminal.switchScreenMode(.@"47", enabled),
-            .alt_screen => self.terminal.switchScreenMode(.@"1047", enabled),
-            .alt_screen_save_cursor_clear_enter => self.terminal.switchScreenMode(.@"1049", enabled),
+                }
+            },
             else => {},
         }
     }
 };
 
-export fn ghostty_vt_terminal_new(cols: u16, rows: u16) callconv(.C) ?*anyopaque {
+export fn ghostty_vt_terminal_new(cols: u16, rows: u16) callconv(.c) ?*anyopaque {
     const alloc = std.heap.c_allocator;
     const handle = TerminalHandle.init(alloc, cols, rows) catch return null;
     return @ptrCast(handle);
 }
 
-export fn ghostty_vt_terminal_free(terminal_ptr: ?*anyopaque) callconv(.C) void {
+export fn ghostty_vt_terminal_free(terminal_ptr: ?*anyopaque) callconv(.c) void {
     if (terminal_ptr == null) return;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
     handle.deinit();
@@ -223,7 +178,7 @@ export fn ghostty_vt_terminal_set_default_colors(
     bg_r: u8,
     bg_g: u8,
     bg_b: u8,
-) callconv(.C) void {
+) callconv(.c) void {
     if (terminal_ptr == null) return;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
     handle.default_fg = .{ .r = fg_r, .g = fg_g, .b = fg_b };
@@ -234,14 +189,11 @@ export fn ghostty_vt_terminal_feed(
     terminal_ptr: ?*anyopaque,
     bytes: [*]const u8,
     len: usize,
-) callconv(.C) c_int {
+) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
-    var i: usize = 0;
-    while (i < len) : (i += 1) {
-        handle.stream.next(bytes[i]) catch return 2;
-    }
+    handle.stream.nextSlice(bytes[0..len]) catch return 2;
 
     return 0;
 }
@@ -250,7 +202,7 @@ export fn ghostty_vt_terminal_resize(
     terminal_ptr: ?*anyopaque,
     cols: u16,
     rows: u16,
-) callconv(.C) c_int {
+) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
@@ -265,27 +217,27 @@ export fn ghostty_vt_terminal_resize(
 export fn ghostty_vt_terminal_scroll_viewport(
     terminal_ptr: ?*anyopaque,
     delta_lines: i32,
-) callconv(.C) c_int {
+) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
-    handle.terminal.scrollViewport(.{ .delta = @as(isize, delta_lines) }) catch return 2;
+    handle.terminal.scrollViewport(.{ .delta = @as(isize, delta_lines) });
     return 0;
 }
 
-export fn ghostty_vt_terminal_scroll_viewport_top(terminal_ptr: ?*anyopaque) callconv(.C) c_int {
+export fn ghostty_vt_terminal_scroll_viewport_top(terminal_ptr: ?*anyopaque) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
-    handle.terminal.scrollViewport(.top) catch return 2;
+    handle.terminal.scrollViewport(.top);
     return 0;
 }
 
-export fn ghostty_vt_terminal_scroll_viewport_bottom(terminal_ptr: ?*anyopaque) callconv(.C) c_int {
+export fn ghostty_vt_terminal_scroll_viewport_bottom(terminal_ptr: ?*anyopaque) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
-    handle.terminal.scrollViewport(.bottom) catch return 2;
+    handle.terminal.scrollViewport(.bottom);
     return 0;
 }
 
@@ -293,22 +245,22 @@ export fn ghostty_vt_terminal_cursor_position(
     terminal_ptr: ?*anyopaque,
     col_out: ?*u16,
     row_out: ?*u16,
-) callconv(.C) bool {
+) callconv(.c) bool {
     if (terminal_ptr == null) return false;
     if (col_out == null or row_out == null) return false;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
-    col_out.?.* = @intCast(handle.terminal.screen.cursor.x + 1);
-    row_out.?.* = @intCast(handle.terminal.screen.cursor.y + 1);
+    col_out.?.* = @intCast(handle.terminal.screens.active.cursor.x + 1);
+    row_out.?.* = @intCast(handle.terminal.screens.active.cursor.y + 1);
     return true;
 }
 
-export fn ghostty_vt_terminal_dump_viewport(terminal_ptr: ?*anyopaque) callconv(.C) ghostty_vt_bytes_t {
+export fn ghostty_vt_terminal_dump_viewport(terminal_ptr: ?*anyopaque) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
     const alloc = std.heap.c_allocator;
-    const slice = handle.terminal.screen.dumpStringAlloc(alloc, .{ .viewport = .{} }) catch {
+    const slice = handle.terminal.screens.active.dumpStringAlloc(alloc, .{ .viewport = .{} }) catch {
         return .{ .ptr = null, .len = 0 };
     };
 
@@ -318,24 +270,23 @@ export fn ghostty_vt_terminal_dump_viewport(terminal_ptr: ?*anyopaque) callconv(
 export fn ghostty_vt_terminal_dump_viewport_row(
     terminal_ptr: ?*anyopaque,
     row: u16,
-) callconv(.C) ghostty_vt_bytes_t {
+) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
     const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
-    const pin = handle.terminal.screen.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+    const pin = handle.terminal.screens.active.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
 
     const alloc = std.heap.c_allocator;
-    var builder = std.ArrayList(u8).init(alloc);
-    errdefer builder.deinit();
-
-    handle.terminal.screen.pages.encodeUtf8(builder.writer(), .{
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    handle.terminal.screens.active.dumpString(&aw.writer, .{
         .tl = pin,
         .br = pin,
         .unwrap = false,
     }) catch return .{ .ptr = null, .len = 0 };
+    aw.writer.flush() catch return .{ .ptr = null, .len = 0 };
 
-    const slice = builder.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
+    const slice = aw.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
     return .{ .ptr = slice.ptr, .len = slice.len };
 }
 
@@ -353,20 +304,20 @@ const CellStyle = extern struct {
 export fn ghostty_vt_terminal_dump_viewport_row_cell_styles(
     terminal_ptr: ?*anyopaque,
     row: u16,
-) callconv(.C) ghostty_vt_bytes_t {
+) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
     const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
-    const pin = handle.terminal.screen.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+    const pin = handle.terminal.screens.active.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
     const cells = pin.cells(.all);
 
     const default_fg: terminal.color.RGB = handle.default_fg;
     const default_bg: terminal.color.RGB = handle.default_bg;
-    const palette: *const terminal.color.Palette = &handle.terminal.color_palette.colors;
+    const palette: *const terminal.color.Palette = &handle.terminal.colors.palette.current;
 
     const alloc = std.heap.c_allocator;
-    var out = std.ArrayList(u8).init(alloc);
+    var out = std.array_list.AlignedManaged(u8, null).init(alloc);
     errdefer out.deinit();
 
     out.ensureTotalCapacity(cells.len * @sizeOf(CellStyle)) catch return .{ .ptr = null, .len = 0 };
@@ -451,20 +402,20 @@ fn resolvedStyle(
 export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
     terminal_ptr: ?*anyopaque,
     row: u16,
-) callconv(.C) ghostty_vt_bytes_t {
+) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
     const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
-    const pin = handle.terminal.screen.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+    const pin = handle.terminal.screens.active.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
     const cells = pin.cells(.all);
 
     const default_fg: terminal.color.RGB = handle.default_fg;
     const default_bg: terminal.color.RGB = handle.default_bg;
-    const palette: *const terminal.color.Palette = &handle.terminal.color_palette.colors;
+    const palette: *const terminal.color.Palette = &handle.terminal.colors.palette.current;
 
     const alloc = std.heap.c_allocator;
-    var out = std.ArrayList(u8).init(alloc);
+    var out = std.array_list.AlignedManaged(u8, null).init(alloc);
     errdefer out.deinit();
 
     if (cells.len == 0) {
@@ -597,13 +548,13 @@ export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
 export fn ghostty_vt_terminal_take_dirty_viewport_rows(
     terminal_ptr: ?*anyopaque,
     rows: u16,
-) callconv(.C) ghostty_vt_bytes_t {
+) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null or rows == 0) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
     const alloc = std.heap.c_allocator;
 
-    var out = std.ArrayList(u8).init(alloc);
+    var out = std.array_list.AlignedManaged(u8, null).init(alloc);
     errdefer out.deinit();
 
     const dirty = handle.terminal.flags.dirty;
@@ -618,15 +569,14 @@ export fn ghostty_vt_terminal_take_dirty_viewport_rows(
     var y: u32 = 0;
     while (y < rows) : (y += 1) {
         const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = y } };
-        const pin = handle.terminal.screen.pages.pin(pt) orelse continue;
+        const pin = handle.terminal.screens.active.pages.pin(pt) orelse continue;
         if (!force_full_redraw and !pin.isDirty()) continue;
 
         const v: u16 = @intCast(y);
         out.append(@intCast(v & 0xFF)) catch return .{ .ptr = null, .len = 0 };
         out.append(@intCast((v >> 8) & 0xFF)) catch return .{ .ptr = null, .len = 0 };
 
-        var set = pin.node.data.dirtyBitSet();
-        set.unset(@intCast(pin.y));
+        pin.rowAndCell().row.dirty = false;
     }
 
     const slice = out.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
@@ -645,11 +595,11 @@ fn pinScreenRow(pin: terminal.Pin) u32 {
 
 export fn ghostty_vt_terminal_take_viewport_scroll_delta(
     terminal_ptr: ?*anyopaque,
-) callconv(.C) i32 {
+) callconv(.c) i32 {
     if (terminal_ptr == null) return 0;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
-    const tl = handle.terminal.screen.pages.getTopLeft(.viewport);
+    const tl = handle.terminal.screens.active.pages.getTopLeft(.viewport);
     const current: u32 = pinScreenRow(tl);
 
     if (!handle.has_viewport_top_y_screen) {
@@ -671,14 +621,14 @@ export fn ghostty_vt_terminal_hyperlink_at(
     terminal_ptr: ?*anyopaque,
     col: u16,
     row: u16,
-) callconv(.C) ghostty_vt_bytes_t {
+) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null or col == 0 or row == 0) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
     const x: terminal.size.CellCountInt = @intCast(col - 1);
     const y: u32 = @intCast(row - 1);
     const pt: terminal.point.Point = .{ .viewport = .{ .x = x, .y = y } };
-    const pin = handle.terminal.screen.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+    const pin = handle.terminal.screens.active.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
     const rac = pin.rowAndCell();
     if (!rac.cell.hyperlink) return .{ .ptr = null, .len = 0 };
 
@@ -695,7 +645,7 @@ export fn ghostty_vt_encode_key_named(
     name_ptr: ?[*]const u8,
     name_len: usize,
     modifiers: u16,
-) callconv(.C) ghostty_vt_bytes_t {
+) callconv(.c) ghostty_vt_bytes_t {
     if (name_ptr == null or name_len == 0) return .{ .ptr = null, .len = 0 };
 
     const name = name_ptr.?[0..name_len];
@@ -745,18 +695,23 @@ export fn ghostty_vt_encode_key_named(
         .mods = mods,
     };
 
-    const enc: ghostty_input.KeyEncoder = .{
-        .event = event,
+    const opts: ghostty_input.key_encode.Options = .{
         .alt_esc_prefix = true,
     };
 
-    var buf: [128]u8 = undefined;
-    const encoded = enc.encode(buf[0..]) catch return .{ .ptr = null, .len = 0 };
-    if (encoded.len == 0) return .{ .ptr = null, .len = 0 };
-
     const alloc = std.heap.c_allocator;
-    const duped = alloc.dupe(u8, encoded) catch return .{ .ptr = null, .len = 0 };
-    return .{ .ptr = duped.ptr, .len = duped.len };
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    ghostty_input.key_encode.encode(&aw.writer, event, opts) catch return .{ .ptr = null, .len = 0 };
+    aw.writer.flush() catch return .{ .ptr = null, .len = 0 };
+
+    const slice = aw.toOwnedSlice() catch {
+        return .{ .ptr = null, .len = 0 };
+    };
+    if (slice.len == 0) {
+        alloc.free(slice);
+        return .{ .ptr = null, .len = 0 };
+    }
+    return .{ .ptr = slice.ptr, .len = slice.len };
 }
 
 fn parse_function_key(digits: []const u8) ?ghostty_input.Key {
@@ -792,19 +747,17 @@ const ghostty_vt_bytes_t = extern struct {
     len: usize,
 };
 
-export fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t) callconv(.C) void {
+export fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t) callconv(.c) void {
     if (bytes.ptr == null or bytes.len == 0) return;
     std.heap.c_allocator.free(bytes.ptr.?[0..bytes.len]);
 }
 
-// Ghostty's terminal stream uses this symbol as an optimization hook.
-// Provide a portable scalar implementation so we don't need C++ SIMD deps.
 export fn ghostty_simd_decode_utf8_until_control_seq(
     input: [*]const u8,
     count: usize,
     output: [*]u32,
     output_count: *usize,
-) callconv(.C) usize {
+) callconv(.c) usize {
     var i: usize = 0;
     var out_i: usize = 0;
     while (i < count) {
