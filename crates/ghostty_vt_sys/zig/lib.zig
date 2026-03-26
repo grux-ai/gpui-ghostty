@@ -5,6 +5,15 @@ const terminal = @import("ghostty_src/terminal/main.zig");
 const Allocator = std.mem.Allocator;
 const Action = terminal.StreamAction;
 
+const CursorStyle = enum(u8) {
+    block_blink = 0,
+    block_steady = 1,
+    underline_blink = 2,
+    underline_steady = 3,
+    bar_blink = 4,
+    bar_steady = 5,
+};
+
 const TerminalHandle = struct {
     alloc: Allocator,
     terminal: terminal.Terminal,
@@ -14,6 +23,11 @@ const TerminalHandle = struct {
     default_bg: terminal.color.RGB,
     viewport_top_y_screen: u32,
     has_viewport_top_y_screen: bool,
+    response_buf: std.array_list.AlignedManaged(u8, null),
+    cursor_style: CursorStyle,
+    default_cursor: bool,
+    title_buf: std.array_list.AlignedManaged(u8, null),
+    has_title: bool,
 
     fn init(alloc: Allocator, cols: u16, rows: u16) !*TerminalHandle {
         const handle = try alloc.create(TerminalHandle);
@@ -31,19 +45,27 @@ const TerminalHandle = struct {
         handle.* = .{
             .alloc = alloc,
             .terminal = t,
-            .handler = .{ .terminal = undefined },
+            .handler = .{ .terminal = undefined, .handle = undefined },
             .stream = undefined,
             .default_fg = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
             .default_bg = .{ .r = 0x00, .g = 0x00, .b = 0x00 },
             .viewport_top_y_screen = 0,
             .has_viewport_top_y_screen = true,
+            .response_buf = std.array_list.AlignedManaged(u8, null).init(alloc),
+            .cursor_style = .bar_blink,
+            .default_cursor = true,
+            .title_buf = std.array_list.AlignedManaged(u8, null).init(alloc),
+            .has_title = false,
         };
         handle.handler.terminal = &handle.terminal;
+        handle.handler.handle = handle;
         handle.stream = terminal.Stream(*Handler).initAlloc(alloc, &handle.handler);
         return handle;
     }
 
     fn deinit(self: *TerminalHandle) void {
+        self.title_buf.deinit();
+        self.response_buf.deinit();
         self.stream.deinit();
         self.terminal.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -52,8 +74,62 @@ const TerminalHandle = struct {
 
 const Handler = struct {
     terminal: *terminal.Terminal,
+    handle: *TerminalHandle,
 
     pub fn deinit(_: *Handler) void {}
+
+    fn writeResponse(self: *Handler, bytes: []const u8) void {
+        self.handle.response_buf.appendSlice(bytes) catch {};
+    }
+
+    fn writeCursorPositionReport(self: *Handler) void {
+        const t = self.terminal;
+        const y = t.screens.active.cursor.y;
+        const x = t.screens.active.cursor.x;
+        const row = if (t.modes.get(.origin))
+            y -| t.scrolling_region.top + 1
+        else
+            y + 1;
+        const col = if (t.modes.get(.origin))
+            x -| t.scrolling_region.left + 1
+        else
+            x + 1;
+        var buf: [32]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "\x1b[{d};{d}R", .{ row, col }) catch return;
+        self.writeResponse(slice);
+    }
+
+    fn writeColorReport(self: *Handler, ps: u8, rgb: terminal.color.RGB) void {
+        const r16: u32 = @as(u32, rgb.r) * 0x0101;
+        const g16: u32 = @as(u32, rgb.g) * 0x0101;
+        const b16: u32 = @as(u32, rgb.b) * 0x0101;
+        var buf: [64]u8 = undefined;
+        const slice = std.fmt.bufPrint(&buf, "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}\x1b\\", .{ ps, r16, g16, b16 }) catch return;
+        self.writeResponse(slice);
+    }
+
+    fn setMode(self: *Handler, mode: anytype, enabled: bool) !void {
+        const t = self.terminal;
+        t.modes.set(mode, enabled);
+        if (@intFromEnum(mode) == @intFromEnum(@as(@TypeOf(mode), .reverse_colors))) {
+            t.flags.dirty.reverse_colors = true;
+        } else if (@intFromEnum(mode) == @intFromEnum(@as(@TypeOf(mode), .origin))) {
+            if (enabled) t.setCursorPos(1, 1);
+        } else if (@intFromEnum(mode) == @intFromEnum(@as(@TypeOf(mode), .alt_screen_legacy))) {
+            try t.switchScreenMode(.@"47", enabled);
+        } else if (@intFromEnum(mode) == @intFromEnum(@as(@TypeOf(mode), .alt_screen))) {
+            try t.switchScreenMode(.@"1047", enabled);
+        } else if (@intFromEnum(mode) == @intFromEnum(@as(@TypeOf(mode), .alt_screen_save_cursor_clear_enter))) {
+            try t.switchScreenMode(.@"1049", enabled);
+        } else if (@intFromEnum(mode) == @intFromEnum(@as(@TypeOf(mode), .save_cursor))) {
+            if (enabled) t.saveCursor() else t.restoreCursor();
+        } else if (@intFromEnum(mode) == @intFromEnum(@as(@TypeOf(mode), .enable_left_and_right_margin))) {
+            if (!enabled) {
+                const cols: usize = @intCast(t.cols);
+                t.setLeftAndRightMargin(0, cols);
+            }
+        }
+    }
 
     pub fn vt(
         self: *Handler,
@@ -63,10 +139,17 @@ const Handler = struct {
         const t = self.terminal;
         switch (action) {
             .print => try t.print(value.cp),
+            .print_repeat => try t.printRepeat(value),
+            .bell => {},
             .backspace => t.backspace(),
             .horizontal_tab => {
                 for (0..@as(usize, value)) |_| {
                     t.horizontalTab();
+                }
+            },
+            .horizontal_tab_back => {
+                for (0..@as(usize, value)) |_| {
+                    t.horizontalTabBack();
                 }
             },
             .linefeed => try t.linefeed(),
@@ -76,46 +159,95 @@ const Handler = struct {
             .configure_charset => t.configureCharset(value.slot, value.charset),
             .cursor_left => t.cursorLeft(value.value),
             .cursor_right => t.cursorRight(value.value),
-            .cursor_down => {
-                t.cursorDown(value.value);
-            },
-            .cursor_up => {
-                t.cursorUp(value.value);
-            },
+            .cursor_down => t.cursorDown(value.value),
+            .cursor_up => t.cursorUp(value.value),
             .cursor_col => t.setCursorPos(t.screens.active.cursor.y + 1, value.value),
             .cursor_row => t.setCursorPos(value.value, t.screens.active.cursor.x + 1),
+            .cursor_col_relative => t.setCursorPos(t.screens.active.cursor.y + 1, t.screens.active.cursor.x + 1 + value.value),
+            .cursor_row_relative => t.setCursorPos(t.screens.active.cursor.y + 1 + value.value, t.screens.active.cursor.x + 1),
             .cursor_pos => t.setCursorPos(value.row, value.col),
+            .cursor_style => {
+                const h = self.handle;
+                if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .default))) {
+                    h.default_cursor = true;
+                    h.cursor_style = .bar_blink;
+                } else if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .blinking_block))) {
+                    h.default_cursor = false;
+                    h.cursor_style = .block_blink;
+                } else if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .steady_block))) {
+                    h.default_cursor = false;
+                    h.cursor_style = .block_steady;
+                } else if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .blinking_underline))) {
+                    h.default_cursor = false;
+                    h.cursor_style = .underline_blink;
+                } else if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .steady_underline))) {
+                    h.default_cursor = false;
+                    h.cursor_style = .underline_steady;
+                } else if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .blinking_bar))) {
+                    h.default_cursor = false;
+                    h.cursor_style = .bar_blink;
+                } else if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .steady_bar))) {
+                    h.default_cursor = false;
+                    h.cursor_style = .bar_steady;
+                }
+            },
+            .save_cursor => t.saveCursor(),
+            .restore_cursor => t.restoreCursor(),
             .erase_display_below => t.eraseDisplay(.below, value),
             .erase_display_above => t.eraseDisplay(.above, value),
-            .erase_display_complete => t.eraseDisplay(.complete, value),
+            .erase_display_complete => {
+                t.scrollViewport(.{ .bottom = {} });
+                t.eraseDisplay(.complete, value);
+            },
             .erase_display_scrollback => t.eraseDisplay(.scrollback, value),
+            .erase_display_scroll_complete => t.eraseDisplay(.scroll_complete, value),
             .erase_line_right => t.eraseLine(.right, value),
             .erase_line_left => t.eraseLine(.left, value),
             .erase_line_complete => t.eraseLine(.complete, value),
+            .erase_line_right_unless_pending_wrap => t.eraseLine(.right_unless_pending_wrap, value),
+            .delete_chars => t.deleteChars(value),
+            .erase_chars => t.eraseChars(value),
+            .insert_lines => t.insertLines(value),
+            .insert_blanks => t.insertBlanks(value),
+            .delete_lines => t.deleteLines(value),
+            .scroll_up => try t.scrollUp(value),
+            .scroll_down => t.scrollDown(value),
+            .index => try t.index(),
+            .next_line => {
+                t.carriageReturn();
+                try t.index();
+            },
+            .reverse_index => t.reverseIndex(),
+            .tab_set => t.tabSet(),
+            .tab_clear_current => t.tabClear(.current),
+            .tab_clear_all => t.tabClear(.all),
+            .tab_reset => t.tabClear(.all),
+            .top_and_bottom_margin => t.setTopAndBottomMargin(value.top_left, value.bottom_right),
+            .left_and_right_margin => t.setLeftAndRightMargin(value.top_left, value.bottom_right),
+            .left_and_right_margin_ambiguous => {
+                if (t.modes.get(.enable_left_and_right_margin)) {
+                    t.setLeftAndRightMargin(0, 0);
+                } else {
+                    t.saveCursor();
+                }
+            },
+            .full_reset => {
+                t.fullReset();
+                self.handle.cursor_style = .bar_blink;
+                self.handle.default_cursor = true;
+            },
+            .decaln => try t.decaln(),
             .start_hyperlink => try t.screens.active.startHyperlink(value.uri, value.id),
             .end_hyperlink => t.screens.active.endHyperlink(),
-            .set_mode => {
-                const mode = value.mode;
-                t.modes.set(mode, true);
-                switch (mode) {
-                    .reverse_colors => t.flags.dirty.reverse_colors = true,
-                    .alt_screen_legacy => try t.switchScreenMode(.@"47", true),
-                    .alt_screen => try t.switchScreenMode(.@"1047", true),
-                    .alt_screen_save_cursor_clear_enter => try t.switchScreenMode(.@"1049", true),
-                    else => {},
-                }
+            .set_mode => try self.setMode(value.mode, true),
+            .reset_mode => try self.setMode(value.mode, false),
+            .save_mode => t.modes.save(value.mode),
+            .restore_mode => {
+                const v = t.modes.restore(value.mode);
+                try self.setMode(value.mode, v);
             },
-            .reset_mode => {
-                const mode = value.mode;
-                t.modes.set(mode, false);
-                switch (mode) {
-                    .reverse_colors => t.flags.dirty.reverse_colors = true,
-                    .alt_screen_legacy => try t.switchScreenMode(.@"47", false),
-                    .alt_screen => try t.switchScreenMode(.@"1047", false),
-                    .alt_screen_save_cursor_clear_enter => try t.switchScreenMode(.@"1049", false),
-                    else => {},
-                }
-            },
+            .request_mode => {},
+            .request_mode_unknown => {},
             .color_operation => {
                 const requests = value.requests;
                 if (requests.count() == 0) return;
@@ -128,6 +260,23 @@ const Handler = struct {
                                 t.colors.palette.current[i] = set.color;
                                 t.colors.palette.mask.set(i);
                                 t.flags.dirty.palette = true;
+                            },
+                            else => {},
+                        },
+                        .query => |target| switch (target) {
+                            .palette => |i| {
+                                const rgb = t.colors.palette.current[i];
+                                self.writeColorReport(4, rgb);
+                            },
+                            .dynamic => |dyn| {
+                                const ps: u8 = @intFromEnum(dyn);
+                                const rgb = switch (dyn) {
+                                    .foreground => self.handle.default_fg,
+                                    .background => self.handle.default_bg,
+                                    .cursor => self.handle.default_fg,
+                                    else => continue,
+                                };
+                                self.writeColorReport(ps, rgb);
                             },
                             else => {},
                         },
@@ -153,7 +302,67 @@ const Handler = struct {
                     }
                 }
             },
-            else => {},
+            .enquiry => {},
+            .device_attributes => {
+                if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .primary))) {
+                    self.writeResponse("\x1b[?62;22c");
+                } else if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .secondary))) {
+                    self.writeResponse("\x1b[>1;10;0c");
+                }
+            },
+            .device_status => {
+                if (@intFromEnum(value.request) == @intFromEnum(@as(@TypeOf(value.request), .operating_status))) {
+                    self.writeResponse("\x1b[0n");
+                } else if (@intFromEnum(value.request) == @intFromEnum(@as(@TypeOf(value.request), .cursor_position))) {
+                    self.writeCursorPositionReport();
+                }
+            },
+            .kitty_keyboard_query => {},
+            .kitty_keyboard_push => t.screens.active.kitty_keyboard.push(value.flags),
+            .kitty_keyboard_pop => t.screens.active.kitty_keyboard.pop(@intCast(value)),
+            .kitty_keyboard_set => t.screens.active.kitty_keyboard.set(.set, value.flags),
+            .kitty_keyboard_set_or => t.screens.active.kitty_keyboard.set(.@"or", value.flags),
+            .kitty_keyboard_set_not => t.screens.active.kitty_keyboard.set(.not, value.flags),
+            .dcs_hook => {},
+            .dcs_put => {},
+            .dcs_unhook => {},
+            .apc_start => {},
+            .apc_end => {},
+            .apc_put => {},
+            .window_title => {
+                const h = self.handle;
+                h.title_buf.clearRetainingCapacity();
+                const title = value.title;
+                if (title.len > 0) {
+                    const max_len = @min(title.len, 256);
+                    h.title_buf.appendSlice(title[0..max_len]) catch {};
+                }
+                h.has_title = true;
+            },
+            .clipboard_contents => {},
+            .show_desktop_notification => {},
+            .progress_report => {},
+            .report_pwd => {},
+            .semantic_prompt => try t.semanticPrompt(value),
+            .mouse_shape => {},
+            .modify_key_format => {
+                t.flags.modify_other_keys_2 = false;
+                if (@intFromEnum(value) == @intFromEnum(@as(@TypeOf(value), .other_keys_numeric))) {
+                    t.flags.modify_other_keys_2 = true;
+                }
+            },
+            .mouse_shift_capture => {
+                t.flags.mouse_shift_capture = if (value) .true else .false;
+            },
+            .protected_mode_off => t.setProtectedMode(.off),
+            .protected_mode_iso => t.setProtectedMode(.iso),
+            .protected_mode_dec => t.setProtectedMode(.dec),
+            .size_report => {},
+            .title_push => {},
+            .title_pop => {},
+            .xtversion => {},
+            .active_status_display => {},
+            .kitty_color_report => {},
         }
     }
 };
@@ -746,6 +955,69 @@ const ghostty_vt_bytes_t = extern struct {
     ptr: ?[*]const u8,
     len: usize,
 };
+
+export fn ghostty_vt_terminal_get_mode(
+    terminal_ptr: ?*anyopaque,
+    mode_value: u16,
+    is_ansi: bool,
+) callconv(.c) bool {
+    if (terminal_ptr == null) return false;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    const tag: terminal.modes.ModeTag = .{ .value = @intCast(mode_value), .ansi = is_ansi };
+    const mode: terminal.modes.Mode = @enumFromInt(@as(u16, @bitCast(tag)));
+    return handle.terminal.modes.get(mode);
+}
+
+const CursorInfo = extern struct {
+    col: u16,
+    row: u16,
+    style: u8,
+    visible: u8,
+};
+
+export fn ghostty_vt_terminal_cursor_info(
+    terminal_ptr: ?*anyopaque,
+) callconv(.c) CursorInfo {
+    const empty: CursorInfo = .{ .col = 0, .row = 0, .style = 0, .visible = 1 };
+    if (terminal_ptr == null) return empty;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    const t = &handle.terminal;
+    return .{
+        .col = @intCast(t.screens.active.cursor.x + 1),
+        .row = @intCast(t.screens.active.cursor.y + 1),
+        .style = @intFromEnum(handle.cursor_style),
+        .visible = @intFromBool(t.modes.get(.cursor_visible)),
+    };
+}
+
+export fn ghostty_vt_terminal_take_title(
+    terminal_ptr: ?*anyopaque,
+) callconv(.c) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    if (!handle.has_title) return .{ .ptr = null, .len = 0 };
+    handle.has_title = false;
+
+    if (handle.title_buf.items.len == 0) return .{ .ptr = null, .len = 0 };
+
+    const alloc = std.heap.c_allocator;
+    const duped = alloc.dupe(u8, handle.title_buf.items) catch return .{ .ptr = null, .len = 0 };
+    return .{ .ptr = duped.ptr, .len = duped.len };
+}
+
+export fn ghostty_vt_terminal_take_response_bytes(
+    terminal_ptr: ?*anyopaque,
+) callconv(.c) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    if (handle.response_buf.items.len == 0) return .{ .ptr = null, .len = 0 };
+
+    const alloc = std.heap.c_allocator;
+    const duped = alloc.dupe(u8, handle.response_buf.items) catch return .{ .ptr = null, .len = 0 };
+    handle.response_buf.clearRetainingCapacity();
+    return .{ .ptr = duped.ptr, .len = duped.len };
+}
 
 export fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t) callconv(.c) void {
     if (bytes.ptr == null or bytes.len == 0) return;

@@ -74,9 +74,22 @@ int32_t ghostty_vt_terminal_take_viewport_scroll_delta(ghostty_vt_terminal_t ter
 ghostty_vt_bytes_t ghostty_vt_terminal_hyperlink_at(ghostty_vt_terminal_t terminal,
                                                     uint16_t col,
                                                     uint16_t row);
+typedef struct ghostty_vt_cursor_info_s {
+  uint16_t col;
+  uint16_t row;
+  uint8_t style;
+  uint8_t visible;
+} ghostty_vt_cursor_info_t;
+
+bool ghostty_vt_terminal_get_mode(ghostty_vt_terminal_t terminal,
+                                  uint16_t mode_value,
+                                  bool is_ansi);
+ghostty_vt_cursor_info_t ghostty_vt_terminal_cursor_info(ghostty_vt_terminal_t terminal);
+ghostty_vt_bytes_t ghostty_vt_terminal_take_title(ghostty_vt_terminal_t terminal);
+ghostty_vt_bytes_t ghostty_vt_terminal_take_response_bytes(ghostty_vt_terminal_t terminal);
 ghostty_vt_bytes_t ghostty_vt_encode_key_named(const uint8_t* name,
-                                               size_t name_len,
-                                               uint16_t modifiers);
+                                                size_t name_len,
+                                                uint16_t modifiers);
 void ghostty_vt_bytes_free(ghostty_vt_bytes_t bytes);
 
 #ifdef __cplusplus

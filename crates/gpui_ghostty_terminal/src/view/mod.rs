@@ -225,6 +225,7 @@ pub struct TerminalView {
     marked_text: Option<SharedString>,
     marked_selected_range_utf16: Range<usize>,
     font: gpui::Font,
+    font_features: gpui::FontFeatures,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -263,6 +264,7 @@ impl TerminalView {
             marked_text: None,
             marked_selected_range_utf16: 0..0,
             font: crate::default_terminal_font(),
+            font_features: crate::default_terminal_font_features(),
         }
         .with_refreshed_viewport()
     }
@@ -281,6 +283,18 @@ impl TerminalView {
         } else {
             self.send_input_parts(&[b"\t"], cx);
         }
+    }
+
+    pub fn set_font(&mut self, font: gpui::Font) {
+        self.font = font;
+        self.line_layouts.clear();
+        self.line_layout_key = None;
+    }
+
+    pub fn set_font_features(&mut self, features: gpui::FontFeatures) {
+        self.font_features = features;
+        self.line_layouts.clear();
+        self.line_layout_key = None;
     }
 
     pub fn new_with_input(
@@ -306,6 +320,7 @@ impl TerminalView {
             marked_text: None,
             marked_selected_range_utf16: 0..0,
             font: crate::default_terminal_font(),
+            font_features: crate::default_terminal_font_features(),
         }
         .with_refreshed_viewport()
     }
@@ -1135,7 +1150,7 @@ impl TerminalView {
             return None;
         }
 
-        let (_, cell_height) = cell_metrics(window, &self.font)?;
+        let (_, cell_height) = cell_metrics(window, &self.font, &self.font_features)?;
         let y = f32::from(position.y);
         let mut row_index = (y / cell_height).floor() as i32;
         if row_index < 0 {
@@ -1171,7 +1186,7 @@ impl TerminalView {
         let rows = self.session.rows();
 
         let position = self.mouse_position_to_local(position);
-        let (cell_width, cell_height) = cell_metrics(window, &self.font)?;
+        let (cell_width, cell_height) = cell_metrics(window, &self.font, &self.font_features)?;
         let x = f32::from(position.x);
         let y = f32::from(position.y);
 
@@ -1277,7 +1292,7 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let (col, row) = self.session.cursor_position()?;
-        let (cell_width, cell_height) = cell_metrics(window, &self.font)?;
+        let (cell_width, cell_height) = cell_metrics(window, &self.font, &self.font_features)?;
 
         let base_x = element_bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
         let base_y = element_bounds.top() + px(cell_height * (row.saturating_sub(1)) as f32);
@@ -1569,9 +1584,12 @@ impl Element for TerminalTextElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let mut style = window.text_style();
-        let font = { self.view.read(cx).font.clone() };
+        let (font, font_features) = {
+            let view = self.view.read(cx);
+            (view.font.clone(), view.font_features.clone())
+        };
         style.font_family = font.family.clone();
-        style.font_features = crate::default_terminal_font_features();
+        style.font_features = font_features.clone();
         style.font_fallbacks = font.fallbacks.clone();
         let default_fg = { self.view.read(cx).session.default_foreground() };
         style.color = hsla_from_rgb(default_fg);
@@ -1582,7 +1600,7 @@ impl Element for TerminalTextElement {
         let run_font = style.font();
         let run_color = style.color;
 
-        let cell_width = cell_metrics(window, &font).map(|(w, _)| px(w));
+        let cell_width = cell_metrics(window, &font, &font_features).map(|(w, _)| px(w));
 
         self.view.update(cx, |view, _cx| {
             if view.viewport_lines.is_empty() {
@@ -1689,7 +1707,7 @@ impl Element for TerminalTextElement {
         });
 
         let default_bg = { self.view.read(cx).session.default_background() };
-        let background_quads = cell_metrics(window, &font)
+        let background_quads = cell_metrics(window, &font, &font_features)
             .map(|(cell_width, _)| {
                 let origin = bounds.origin;
                 let mut quads: Vec<PaintQuad> = Vec::new();
@@ -1751,7 +1769,7 @@ impl Element for TerminalTextElement {
                     return None;
                 }
                 let (col, row) = cursor_position?;
-                let (cell_width, _) = cell_metrics(window, &font)?;
+                let (cell_width, _) = cell_metrics(window, &font, &font_features)?;
 
                 let origin_x = bounds.left() + px(cell_width * (col.saturating_sub(1)) as f32);
                 let origin_y = bounds.top() + line_height * (row.saturating_sub(1)) as f32;
@@ -1862,7 +1880,7 @@ impl Element for TerminalTextElement {
             })
             .unwrap_or_default();
 
-        let box_drawing_quads = cell_metrics(window, &font)
+        let box_drawing_quads = cell_metrics(window, &font, &font_features)
             .map(|(cell_width, _)| {
                 use unicode_width::UnicodeWidthChar as _;
                 let default_fg = run_color;
@@ -2052,14 +2070,11 @@ impl Render for TerminalView {
         }
 
         if self.session.window_title_updates_enabled() {
-            let title = self
-                .session
-                .title()
-                .unwrap_or("GPUI Embedded Terminal (Ghostty VT)");
-
-            if self.last_window_title.as_deref() != Some(title) {
-                window.set_window_title(title);
-                self.last_window_title = Some(title.to_string());
+            if let Some(title) = self.session.take_title() {
+                if self.last_window_title.as_deref() != Some(title.as_str()) {
+                    window.set_window_title(&title);
+                    self.last_window_title = Some(title);
+                }
             }
         }
 
@@ -2090,10 +2105,14 @@ impl Render for TerminalView {
     }
 }
 
-pub(crate) fn cell_metrics(window: &mut gpui::Window, font: &gpui::Font) -> Option<(f32, f32)> {
+pub(crate) fn cell_metrics(
+    window: &mut gpui::Window,
+    font: &gpui::Font,
+    font_features: &gpui::FontFeatures,
+) -> Option<(f32, f32)> {
     let mut style = window.text_style();
     style.font_family = font.family.clone();
-    style.font_features = crate::default_terminal_font_features();
+    style.font_features = font_features.clone();
     style.font_fallbacks = font.fallbacks.clone();
 
     let rem_size = window.rem_size();

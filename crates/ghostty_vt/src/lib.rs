@@ -50,6 +50,25 @@ pub struct StyleRun {
     pub flags: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CursorShape {
+    BlockBlink = 0,
+    BlockSteady = 1,
+    UnderlineBlink = 2,
+    UnderlineSteady = 3,
+    BarBlink = 4,
+    BarSteady = 5,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CursorInfo {
+    pub col: u16,
+    pub row: u16,
+    pub shape: CursorShape,
+    pub visible: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeyModifiers {
     pub shift: bool,
@@ -294,6 +313,53 @@ impl Terminal {
         let s = String::from_utf8_lossy(slice).into_owned();
         unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
         Some(s)
+    }
+
+    pub fn get_mode(&self, mode_value: u16, is_ansi: bool) -> bool {
+        unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_get_mode(self.ptr.as_ptr(), mode_value, is_ansi)
+        }
+    }
+
+    pub fn cursor_info(&self) -> CursorInfo {
+        let raw = unsafe { ghostty_vt_sys::ghostty_vt_terminal_cursor_info(self.ptr.as_ptr()) };
+        CursorInfo {
+            col: raw.col,
+            row: raw.row,
+            shape: match raw.style {
+                0 => CursorShape::BlockBlink,
+                1 => CursorShape::BlockSteady,
+                2 => CursorShape::UnderlineBlink,
+                3 => CursorShape::UnderlineSteady,
+                4 => CursorShape::BarBlink,
+                5 => CursorShape::BarSteady,
+                _ => CursorShape::BarBlink,
+            },
+            visible: raw.visible != 0,
+        }
+    }
+
+    pub fn take_title(&mut self) -> Option<String> {
+        let bytes = unsafe { ghostty_vt_sys::ghostty_vt_terminal_take_title(self.ptr.as_ptr()) };
+        if bytes.ptr.is_null() || bytes.len == 0 {
+            return None;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let s = String::from_utf8_lossy(slice).into_owned();
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        Some(s)
+    }
+
+    pub fn take_response_bytes(&mut self) -> Option<Vec<u8>> {
+        let bytes =
+            unsafe { ghostty_vt_sys::ghostty_vt_terminal_take_response_bytes(self.ptr.as_ptr()) };
+        if bytes.ptr.is_null() || bytes.len == 0 {
+            return None;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let out = slice.to_vec();
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        Some(out)
     }
 
     pub fn scroll_viewport(&mut self, delta_lines: i32) -> Result<(), Error> {

@@ -4,6 +4,14 @@ pub struct ghostty_vt_bytes_t {
     pub len: usize,
 }
 
+#[repr(C)]
+pub struct ghostty_vt_cursor_info_t {
+    pub col: u16,
+    pub row: u16,
+    pub style: u8,
+    pub visible: u8,
+}
+
 pub const PINNED_GHOSTTY_TAG: &str = "v1.2.3";
 pub const PINNED_ZIG_VERSION: &str = "0.14.1";
 
@@ -82,6 +90,22 @@ unsafe extern "C" {
         terminal: *mut core::ffi::c_void,
         col: u16,
         row: u16,
+    ) -> ghostty_vt_bytes_t;
+
+    pub fn ghostty_vt_terminal_get_mode(
+        terminal: *mut core::ffi::c_void,
+        mode_value: u16,
+        is_ansi: bool,
+    ) -> bool;
+
+    pub fn ghostty_vt_terminal_cursor_info(
+        terminal: *mut core::ffi::c_void,
+    ) -> ghostty_vt_cursor_info_t;
+
+    pub fn ghostty_vt_terminal_take_title(terminal: *mut core::ffi::c_void) -> ghostty_vt_bytes_t;
+
+    pub fn ghostty_vt_terminal_take_response_bytes(
+        terminal: *mut core::ffi::c_void,
     ) -> ghostty_vt_bytes_t;
 
     pub fn ghostty_vt_encode_key_named(
