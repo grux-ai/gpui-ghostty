@@ -99,6 +99,15 @@ pub struct KeyModifiers {
     pub super_key: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum KeyAction {
+    #[default]
+    Press = 0,
+    Repeat = 1,
+    Release = 2,
+}
+
 impl KeyModifiers {
     fn bits(self) -> u16 {
         let mut bits = 0u16;
@@ -422,6 +431,39 @@ impl Terminal {
         let s = String::from_utf8_lossy(slice).into_owned();
         unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
         Some(s)
+    }
+
+    pub fn encode_key(
+        &self,
+        key_name: &str,
+        utf8: &str,
+        modifiers: KeyModifiers,
+        action: KeyAction,
+    ) -> Option<Vec<u8>> {
+        let key_name_ptr = key_name.as_ptr();
+        let key_name_len = key_name.len();
+        let utf8_ptr = utf8.as_ptr();
+        let utf8_len = utf8.len();
+
+        let bytes = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_encode_key(
+                self.ptr.as_ptr(),
+                key_name_ptr,
+                key_name_len,
+                utf8_ptr,
+                utf8_len,
+                modifiers.bits(),
+                action as u8,
+            )
+        };
+
+        if bytes.ptr.is_null() || bytes.len == 0 {
+            return None;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let out = slice.to_vec();
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        Some(out)
     }
 
     pub fn take_response_bytes(&mut self) -> Option<Vec<u8>> {

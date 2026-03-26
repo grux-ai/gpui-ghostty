@@ -1,4 +1,4 @@
-use ghostty_vt::{CursorInfo, Error, PackedCell, Rgb, Terminal};
+use ghostty_vt::{CursorInfo, Error, KeyAction, KeyModifiers, PackedCell, Rgb, Terminal};
 
 use crate::TerminalConfig;
 
@@ -58,6 +58,16 @@ impl TerminalSession {
 
     pub fn mouse_any_event_enabled(&self) -> bool {
         self.terminal.get_mode(1003, false)
+    }
+
+    pub fn encode_key(
+        &self,
+        key_name: &str,
+        utf8: &str,
+        modifiers: KeyModifiers,
+        action: KeyAction,
+    ) -> Option<Vec<u8>> {
+        self.terminal.encode_key(key_name, utf8, modifiers, action)
     }
 
     pub fn cursor_info(&self) -> CursorInfo {

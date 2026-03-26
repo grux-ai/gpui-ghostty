@@ -1,5 +1,5 @@
 use super::TerminalSession;
-use ghostty_vt::{CursorShape, KeyModifiers, Rgb, StyleRun, encode_key_named};
+use ghostty_vt::{CursorShape, KeyAction, KeyModifiers, Rgb, StyleRun};
 use gpui::{
     App, BorderStyle, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
     EntityInputHandler, FocusHandle, GlobalElementId, IntoElement, KeyBinding, KeyDownEvent,
@@ -22,6 +22,32 @@ fn ensure_key_bindings(cx: &mut App) {
             KeyBinding::new("shift-tab", TabPrev, Some(KEY_CONTEXT)),
         ]);
     });
+}
+
+fn is_named_key(key: &str) -> bool {
+    matches!(
+        key,
+        "up" | "down"
+            | "left"
+            | "right"
+            | "home"
+            | "end"
+            | "pageup"
+            | "page_up"
+            | "page-up"
+            | "pagedown"
+            | "page_down"
+            | "page-down"
+            | "insert"
+            | "delete"
+            | "backspace"
+            | "enter"
+            | "tab"
+            | "escape"
+            | "space"
+    ) || key.starts_with('f')
+        && key.len() >= 2
+        && key.as_bytes()[1].is_ascii_digit()
 }
 
 pub(crate) fn should_skip_key_down_for_ime(has_input: bool, keystroke: &gpui::Keystroke) -> bool {
@@ -1022,99 +1048,46 @@ impl TerminalView {
 
         let scroll_step = (self.session.rows() as i32 / 2).max(1);
 
-        if let Some(input) = self.input.as_ref() {
-            if keystroke.modifiers.shift {
-                match keystroke.key.as_str() {
-                    "home" => {
-                        let _ = self.session.scroll_viewport_top();
-                        self.sync_viewport_scroll_tracking();
-                        self.apply_side_effects(cx);
-                        self.schedule_viewport_refresh(cx);
-                        return;
-                    }
-                    "end" => {
-                        let _ = self.session.scroll_viewport_bottom();
-                        self.sync_viewport_scroll_tracking();
-                        self.apply_side_effects(cx);
-                        self.schedule_viewport_refresh(cx);
-                        return;
-                    }
-                    "pageup" | "page_up" | "page-up" => {
-                        let _ = self.session.scroll_viewport(-scroll_step);
-                        self.sync_viewport_scroll_tracking();
-                        self.apply_side_effects(cx);
-                        self.schedule_viewport_refresh(cx);
-                        return;
-                    }
-                    "pagedown" | "page_down" | "page-down" => {
-                        let _ = self.session.scroll_viewport(scroll_step);
-                        self.sync_viewport_scroll_tracking();
-                        self.apply_side_effects(cx);
-                        self.schedule_viewport_refresh(cx);
-                        return;
-                    }
-                    _ => {}
+        if keystroke.modifiers.shift {
+            match keystroke.key.as_str() {
+                "home" => {
+                    let _ = self.session.scroll_viewport_top();
+                    self.sync_viewport_scroll_tracking();
+                    self.apply_side_effects(cx);
+                    self.schedule_viewport_refresh(cx);
+                    return;
                 }
+                "end" => {
+                    let _ = self.session.scroll_viewport_bottom();
+                    self.sync_viewport_scroll_tracking();
+                    self.apply_side_effects(cx);
+                    self.schedule_viewport_refresh(cx);
+                    return;
+                }
+                "pageup" | "page_up" | "page-up" => {
+                    let _ = self.session.scroll_viewport(-scroll_step);
+                    self.sync_viewport_scroll_tracking();
+                    self.apply_side_effects(cx);
+                    self.schedule_viewport_refresh(cx);
+                    return;
+                }
+                "pagedown" | "page_down" | "page-down" => {
+                    let _ = self.session.scroll_viewport(scroll_step);
+                    self.sync_viewport_scroll_tracking();
+                    self.apply_side_effects(cx);
+                    self.schedule_viewport_refresh(cx);
+                    return;
+                }
+                _ => {}
             }
-
-            if keystroke.modifiers.control
-                && let Some(b) = ctrl_byte_for_keystroke(&keystroke)
-            {
-                input.send(&[b]);
-                return;
-            }
-
-            if keystroke.modifiers.alt
-                && let Some(text) = keystroke.key_char.as_deref()
-            {
-                input.send(&[0x1b]);
-                input.send(text.as_bytes());
-                return;
-            }
-
-            let modifiers = KeyModifiers {
-                shift: keystroke.modifiers.shift,
-                control: keystroke.modifiers.control,
-                alt: keystroke.modifiers.alt,
-                super_key: false,
-            };
-            if let Some(encoded) = encode_key_named(&keystroke.key, modifiers) {
-                input.send(&encoded);
-                return;
-            }
-            return;
         }
 
-        match keystroke.key.as_str() {
-            "home" => {
-                let _ = self.session.scroll_viewport_top();
-                self.sync_viewport_scroll_tracking();
-                self.apply_side_effects(cx);
-                self.schedule_viewport_refresh(cx);
-                return;
-            }
-            "end" => {
-                let _ = self.session.scroll_viewport_bottom();
-                self.sync_viewport_scroll_tracking();
-                self.apply_side_effects(cx);
-                self.schedule_viewport_refresh(cx);
-                return;
-            }
-            "pageup" | "page_up" | "page-up" => {
-                let _ = self.session.scroll_viewport(-scroll_step);
-                self.sync_viewport_scroll_tracking();
-                self.apply_side_effects(cx);
-                self.schedule_viewport_refresh(cx);
-                return;
-            }
-            "pagedown" | "page_down" | "page-down" => {
-                let _ = self.session.scroll_viewport(scroll_step);
-                self.sync_viewport_scroll_tracking();
-                self.apply_side_effects(cx);
-                self.schedule_viewport_refresh(cx);
-                return;
-            }
-            _ => {}
+        if !keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && keystroke.key_char.is_some()
+            && !is_named_key(&keystroke.key)
+        {
+            return;
         }
 
         let modifiers = KeyModifiers {
@@ -1123,21 +1096,21 @@ impl TerminalView {
             alt: keystroke.modifiers.alt,
             super_key: false,
         };
-        if let Some(encoded) = encode_key_named(&keystroke.key, modifiers) {
-            let _ = self.session.feed(&encoded);
-            self.apply_side_effects(cx);
-            self.schedule_viewport_refresh(cx);
-            return;
-        }
+        let action = if event.is_held {
+            KeyAction::Repeat
+        } else {
+            KeyAction::Press
+        };
+        let utf8 = keystroke.key_char.as_deref().unwrap_or("");
 
-        if keystroke.key == "backspace" {
+        if let Some(encoded) = self.session.encode_key(&keystroke.key, utf8, modifiers, action) {
             if let Some(input) = self.input.as_ref() {
-                input.send(&[0x7f]);
-                return;
+                input.send(&encoded);
+            } else {
+                let _ = self.session.feed(&encoded);
+                self.apply_side_effects(cx);
+                self.schedule_viewport_refresh(cx);
             }
-            let _ = self.session.feed(&[0x08]);
-            self.apply_side_effects(cx);
-            self.schedule_viewport_refresh(cx);
         }
     }
 

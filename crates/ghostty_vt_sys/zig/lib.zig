@@ -948,6 +948,110 @@ export fn ghostty_vt_terminal_hyperlink_at(
     return .{ .ptr = duped.ptr, .len = duped.len };
 }
 
+export fn ghostty_vt_terminal_encode_key(
+    terminal_ptr: ?*anyopaque,
+    key_name_ptr: ?[*]const u8,
+    key_name_len: usize,
+    utf8_ptr: ?[*]const u8,
+    utf8_len: usize,
+    modifiers: u16,
+    action: u8,
+) callconv(.c) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    var key_value: ghostty_input.Key = .unidentified;
+    if (key_name_ptr != null and key_name_len > 0) {
+        const name = key_name_ptr.?[0..key_name_len];
+        key_value = mapKeyName(name);
+    }
+
+    var mods: ghostty_input.Mods = .{};
+    if ((modifiers & 0x0001) != 0) mods.shift = true;
+    if ((modifiers & 0x0002) != 0) mods.ctrl = true;
+    if ((modifiers & 0x0004) != 0) mods.alt = true;
+    if ((modifiers & 0x0008) != 0) mods.super = true;
+
+    const utf8: []const u8 = if (utf8_ptr != null and utf8_len > 0)
+        utf8_ptr.?[0..utf8_len]
+    else
+        "";
+
+    const unshifted_cp: u21 = if (utf8.len > 0)
+        std.unicode.utf8Decode(utf8) catch 0
+    else
+        0;
+
+    const event_action: ghostty_input.Action = switch (action) {
+        1 => .repeat,
+        2 => .release,
+        else => .press,
+    };
+
+    const event: ghostty_input.KeyEvent = .{
+        .action = event_action,
+        .key = key_value,
+        .mods = mods,
+        .utf8 = utf8,
+        .unshifted_codepoint = unshifted_cp,
+    };
+
+    const opts = ghostty_input.key_encode.Options.fromTerminal(&handle.terminal);
+
+    const alloc = std.heap.c_allocator;
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    ghostty_input.key_encode.encode(&aw.writer, event, opts) catch return .{ .ptr = null, .len = 0 };
+    aw.writer.flush() catch return .{ .ptr = null, .len = 0 };
+
+    const slice = aw.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
+    if (slice.len == 0) {
+        alloc.free(slice);
+        return .{ .ptr = null, .len = 0 };
+    }
+    return .{ .ptr = slice.ptr, .len = slice.len };
+}
+
+fn mapKeyName(name: []const u8) ghostty_input.Key {
+    if (std.mem.eql(u8, name, "up")) return .arrow_up;
+    if (std.mem.eql(u8, name, "down")) return .arrow_down;
+    if (std.mem.eql(u8, name, "left")) return .arrow_left;
+    if (std.mem.eql(u8, name, "right")) return .arrow_right;
+    if (std.mem.eql(u8, name, "home")) return .home;
+    if (std.mem.eql(u8, name, "end")) return .end;
+    if (std.mem.eql(u8, name, "pageup") or std.mem.eql(u8, name, "page_up") or std.mem.eql(u8, name, "page-up")) return .page_up;
+    if (std.mem.eql(u8, name, "pagedown") or std.mem.eql(u8, name, "page_down") or std.mem.eql(u8, name, "page-down")) return .page_down;
+    if (std.mem.eql(u8, name, "insert")) return .insert;
+    if (std.mem.eql(u8, name, "delete")) return .delete;
+    if (std.mem.eql(u8, name, "backspace")) return .backspace;
+    if (std.mem.eql(u8, name, "enter")) return .enter;
+    if (std.mem.eql(u8, name, "tab")) return .tab;
+    if (std.mem.eql(u8, name, "escape")) return .escape;
+    if (std.mem.eql(u8, name, "space")) return .space;
+    if (name.len == 1) {
+        const c = name[0];
+        if (c >= 'a' and c <= 'z') return @enumFromInt(@as(c_int, @intFromEnum(ghostty_input.Key.key_a)) + (c - 'a'));
+        if (c >= '0' and c <= '9') return @enumFromInt(@as(c_int, @intFromEnum(ghostty_input.Key.digit_0)) + (c - '0'));
+        return switch (c) {
+            '`' => .backquote,
+            '\\' => .backslash,
+            '[' => .bracket_left,
+            ']' => .bracket_right,
+            ',' => .comma,
+            '.' => .period,
+            '/' => .slash,
+            ';' => .semicolon,
+            '\'' => .quote,
+            '-' => .minus,
+            '=' => .equal,
+            else => .unidentified,
+        };
+    }
+    if (name.len >= 2 and name[0] == 'f') {
+        return parse_function_key(name[1..]) orelse .unidentified;
+    }
+    return .unidentified;
+}
+
 export fn ghostty_vt_encode_key_named(
     name_ptr: ?[*]const u8,
     name_len: usize,

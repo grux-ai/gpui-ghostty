@@ -130,6 +130,16 @@ unsafe extern "C" {
         terminal: *mut core::ffi::c_void,
     ) -> ghostty_vt_bytes_t;
 
+    pub fn ghostty_vt_terminal_encode_key(
+        terminal: *mut core::ffi::c_void,
+        key_name: *const u8,
+        key_name_len: usize,
+        utf8: *const u8,
+        utf8_len: usize,
+        modifiers: u16,
+        action: u8,
+    ) -> ghostty_vt_bytes_t;
+
     pub fn ghostty_vt_encode_key_named(
         name: *const u8,
         name_len: usize,
