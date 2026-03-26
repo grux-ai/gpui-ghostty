@@ -24,14 +24,6 @@ fn ensure_key_bindings(cx: &mut App) {
     });
 }
 
-fn split_viewport_lines(viewport: &str) -> Vec<String> {
-    let viewport = viewport.strip_suffix('\n').unwrap_or(viewport);
-    if viewport.is_empty() {
-        return Vec::new();
-    }
-    viewport.split('\n').map(|line| line.to_string()).collect()
-}
-
 pub(crate) fn should_skip_key_down_for_ime(has_input: bool, keystroke: &gpui::Keystroke) -> bool {
     if !has_input || !keystroke.is_ime_in_progress() {
         return false;
@@ -533,20 +525,80 @@ impl TerminalView {
     }
 
     fn refresh_viewport(&mut self) {
-        let viewport = self.session.dump_viewport().unwrap_or_default();
-        self.viewport_lines = split_viewport_lines(&viewport);
-        self.viewport_line_offsets = Self::compute_viewport_line_offsets(&self.viewport_lines);
-        self.viewport_total_len = Self::compute_viewport_total_len(&self.viewport_lines);
-        self.viewport_style_runs = (0..self.session.rows())
-            .map(|row| {
-                self.session
-                    .dump_viewport_row_style_runs(row)
-                    .unwrap_or_default()
-            })
-            .collect();
+        let rows = self.session.rows();
+        let mut lines = Vec::with_capacity(rows as usize);
+        let mut style_runs = Vec::with_capacity(rows as usize);
+
+        for row in 0..rows {
+            let cells = self.session.get_row_cells(row).unwrap_or_default();
+            let (line, runs) = Self::build_line_from_cells(&cells);
+            lines.push(line);
+            style_runs.push(runs);
+        }
+
+        self.viewport_line_offsets = Self::compute_viewport_line_offsets(&lines);
+        self.viewport_total_len = Self::compute_viewport_total_len(&lines);
+        self.viewport_lines = lines;
+        self.viewport_style_runs = style_runs;
         self.line_layouts.clear();
         self.line_layout_key = None;
         self.selection = None;
+    }
+
+    fn build_line_from_cells(cells: &[ghostty_vt::PackedCell]) -> (String, Vec<StyleRun>) {
+        let mut text = String::with_capacity(cells.len());
+        let mut runs: Vec<StyleRun> = Vec::new();
+
+        let mut run_start: u16 = 1;
+        let mut run_fg = ghostty_vt::Rgb { r: 0, g: 0, b: 0 };
+        let mut run_bg = ghostty_vt::Rgb { r: 0, g: 0, b: 0 };
+        let mut run_flags: u8 = 0;
+        let mut has_run = false;
+
+        for (i, cell) in cells.iter().enumerate() {
+            if cell.wide == 2 || cell.wide == 3 {
+                continue;
+            }
+
+            let col = (i as u16) + 1;
+
+            if has_run && (cell.fg != run_fg || cell.bg != run_bg || cell.flags != run_flags) {
+                runs.push(StyleRun {
+                    start_col: run_start,
+                    end_col: col - 1,
+                    fg: run_fg,
+                    bg: run_bg,
+                    flags: run_flags,
+                });
+                run_start = col;
+            }
+
+            run_fg = cell.fg;
+            run_bg = cell.bg;
+            run_flags = cell.flags;
+            has_run = true;
+
+            if cell.codepoint == 0 || cell.codepoint == b' ' as u32 {
+                text.push(' ');
+            } else if let Some(ch) = char::from_u32(cell.codepoint) {
+                text.push(ch);
+            } else {
+                text.push(' ');
+            }
+        }
+
+        if has_run {
+            let last_col = cells.len() as u16;
+            runs.push(StyleRun {
+                start_col: run_start,
+                end_col: last_col,
+                fg: run_fg,
+                bg: run_bg,
+                flags: run_flags,
+            });
+        }
+
+        (text, runs)
     }
 
     fn compute_viewport_line_offsets(lines: &[String]) -> Vec<usize> {
@@ -645,28 +697,24 @@ impl TerminalView {
         }
 
         for &row in dirty_rows {
-            let row = row as usize;
-            if row >= self.viewport_lines.len() {
+            let row_idx = row as usize;
+            if row_idx >= self.viewport_lines.len() {
                 continue;
             }
 
-            let line = match self.session.dump_viewport_row(row as u16) {
-                Ok(s) => s,
+            let cells = match self.session.get_row_cells(row) {
+                Ok(c) => c,
                 Err(_) => {
                     self.refresh_viewport();
                     return true;
                 }
             };
 
-            let line = line.strip_suffix('\n').unwrap_or(line.as_str());
-            self.viewport_lines[row].clear();
-            self.viewport_lines[row].push_str(line);
-            self.viewport_style_runs[row] = self
-                .session
-                .dump_viewport_row_style_runs(row as u16)
-                .unwrap_or_default();
-            if row < self.line_layouts.len() {
-                self.line_layouts[row] = None;
+            let (line, runs) = Self::build_line_from_cells(&cells);
+            self.viewport_lines[row_idx] = line;
+            self.viewport_style_runs[row_idx] = runs;
+            if row_idx < self.line_layouts.len() {
+                self.line_layouts[row_idx] = None;
             }
         }
 

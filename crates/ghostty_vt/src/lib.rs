@@ -52,6 +52,28 @@ pub struct StyleRun {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+pub enum UnderlineStyle {
+    None = 0,
+    Single = 1,
+    Double = 2,
+    Curly = 3,
+    Dotted = 4,
+    Dashed = 5,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PackedCell {
+    pub codepoint: u32,
+    pub fg: Rgb,
+    pub bg: Rgb,
+    pub flags: u8,
+    pub wide: u8,
+    pub underline_style: UnderlineStyle,
+    pub underline_color: Rgb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CursorShape {
     BlockBlink = 0,
     BlockSteady = 1,
@@ -180,6 +202,58 @@ impl Terminal {
         let s = String::from_utf8_lossy(slice).into_owned();
         unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
         Ok(s)
+    }
+
+    pub fn get_row_cells(&self, row: u16) -> Result<Vec<PackedCell>, Error> {
+        let bytes =
+            unsafe { ghostty_vt_sys::ghostty_vt_terminal_get_row_cells(self.ptr.as_ptr(), row) };
+        if bytes.ptr.is_null() {
+            return Err(Error::DumpFailed);
+        }
+        let cell_size = std::mem::size_of::<ghostty_vt_sys::ghostty_vt_packed_cell_t>();
+        if bytes.len == 0 || bytes.len % cell_size != 0 {
+            unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+            return Ok(Vec::new());
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) };
+        let count = bytes.len / cell_size;
+        let mut out = Vec::with_capacity(count);
+        for chunk in slice.chunks_exact(cell_size) {
+            let raw =
+                unsafe { &*(chunk.as_ptr() as *const ghostty_vt_sys::ghostty_vt_packed_cell_t) };
+            out.push(PackedCell {
+                codepoint: raw.codepoint,
+                fg: Rgb {
+                    r: raw.fg_r,
+                    g: raw.fg_g,
+                    b: raw.fg_b,
+                },
+                bg: Rgb {
+                    r: raw.bg_r,
+                    g: raw.bg_g,
+                    b: raw.bg_b,
+                },
+                flags: raw.flags,
+                wide: raw.wide,
+                underline_style: match raw.underline_style {
+                    1 => UnderlineStyle::Single,
+                    2 => UnderlineStyle::Double,
+                    3 => UnderlineStyle::Curly,
+                    4 => UnderlineStyle::Dotted,
+                    5 => UnderlineStyle::Dashed,
+                    _ => UnderlineStyle::None,
+                },
+                underline_color: Rgb {
+                    r: raw.ul_color_r,
+                    g: raw.ul_color_g,
+                    b: raw.ul_color_b,
+                },
+            });
+        }
+
+        unsafe { ghostty_vt_sys::ghostty_vt_bytes_free(bytes) };
+        Ok(out)
     }
 
     pub fn dump_viewport_row_cell_styles(&self, row: u16) -> Result<Vec<CellStyle>, Error> {

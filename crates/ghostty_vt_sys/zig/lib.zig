@@ -499,6 +499,22 @@ export fn ghostty_vt_terminal_dump_viewport_row(
     return .{ .ptr = slice.ptr, .len = slice.len };
 }
 
+const PackedCell = extern struct {
+    codepoint: u32,
+    fg_r: u8,
+    fg_g: u8,
+    fg_b: u8,
+    bg_r: u8,
+    bg_g: u8,
+    bg_b: u8,
+    flags: u8,
+    wide: u8,
+    underline_style: u8,
+    ul_color_r: u8,
+    ul_color_g: u8,
+    ul_color_b: u8,
+};
+
 const CellStyle = extern struct {
     fg_r: u8,
     fg_g: u8,
@@ -749,6 +765,88 @@ export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
         .reserved = 0,
     };
     out.appendSlice(std.mem.asBytes(&last)) catch return .{ .ptr = null, .len = 0 };
+
+    const slice = out.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
+    return .{ .ptr = slice.ptr, .len = slice.len };
+}
+
+export fn ghostty_vt_terminal_get_row_cells(
+    terminal_ptr: ?*anyopaque,
+    row: u16,
+) callconv(.c) ghostty_vt_bytes_t {
+    if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+
+    const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
+    const pin = handle.terminal.screens.active.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+    const cells = pin.cells(.all);
+
+    const default_fg = handle.default_fg;
+    const default_bg = handle.default_bg;
+    const palette = &handle.terminal.colors.palette.current;
+
+    const alloc = std.heap.c_allocator;
+    var out = std.array_list.AlignedManaged(u8, null).init(alloc);
+    errdefer out.deinit();
+
+    out.ensureTotalCapacity(cells.len * @sizeOf(PackedCell)) catch return .{ .ptr = null, .len = 0 };
+
+    for (cells) |*cell| {
+        const s = pin.style(cell);
+
+        var fg = s.fg(.{ .default = default_fg, .palette = palette, .bold = null });
+        var bg = s.bg(cell, palette) orelse default_bg;
+
+        var flags: u8 = 0;
+        if (s.flags.inverse) flags |= 0x01;
+        if (s.flags.bold) flags |= 0x02;
+        if (s.flags.italic) flags |= 0x04;
+        if (s.flags.underline != .none) flags |= 0x08;
+        if (s.flags.faint) flags |= 0x10;
+        if (s.flags.invisible) flags |= 0x20;
+        if (s.flags.strikethrough) flags |= 0x40;
+
+        if (s.flags.inverse) {
+            const tmp = fg;
+            fg = bg;
+            bg = tmp;
+        }
+        if (s.flags.invisible) {
+            fg = bg;
+        }
+
+        const cp: u32 = switch (cell.content_tag) {
+            .codepoint, .codepoint_grapheme => @intCast(cell.content.codepoint),
+            else => 0,
+        };
+
+        const wide_val: u8 = switch (cell.wide) {
+            .narrow => 0,
+            .wide => 1,
+            .spacer_tail => 2,
+            .spacer_head => 3,
+        };
+
+        const ul_style: u8 = @intFromEnum(s.flags.underline);
+        const ul_color = s.underlineColor(palette);
+
+        const pc = PackedCell{
+            .codepoint = cp,
+            .fg_r = fg.r,
+            .fg_g = fg.g,
+            .fg_b = fg.b,
+            .bg_r = bg.r,
+            .bg_g = bg.g,
+            .bg_b = bg.b,
+            .flags = flags,
+            .wide = wide_val,
+            .underline_style = ul_style,
+            .ul_color_r = if (ul_color) |c| c.r else fg.r,
+            .ul_color_g = if (ul_color) |c| c.g else fg.g,
+            .ul_color_b = if (ul_color) |c| c.b else fg.b,
+        };
+        out.appendSlice(std.mem.asBytes(&pc)) catch return .{ .ptr = null, .len = 0 };
+    }
 
     const slice = out.toOwnedSlice() catch return .{ .ptr = null, .len = 0 };
     return .{ .ptr = slice.ptr, .len = slice.len };

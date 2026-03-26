@@ -12,6 +12,23 @@ pub struct ghostty_vt_cursor_info_t {
     pub visible: u8,
 }
 
+#[repr(C)]
+pub struct ghostty_vt_packed_cell_t {
+    pub codepoint: u32,
+    pub fg_r: u8,
+    pub fg_g: u8,
+    pub fg_b: u8,
+    pub bg_r: u8,
+    pub bg_g: u8,
+    pub bg_b: u8,
+    pub flags: u8,
+    pub wide: u8,
+    pub underline_style: u8,
+    pub ul_color_r: u8,
+    pub ul_color_g: u8,
+    pub ul_color_b: u8,
+}
+
 pub const PINNED_GHOSTTY_TAG: &str = "v1.2.3";
 pub const PINNED_ZIG_VERSION: &str = "0.14.1";
 
@@ -75,6 +92,11 @@ unsafe extern "C" {
     ) -> ghostty_vt_bytes_t;
 
     pub fn ghostty_vt_terminal_dump_viewport_row_style_runs(
+        terminal: *mut core::ffi::c_void,
+        row: u16,
+    ) -> ghostty_vt_bytes_t;
+
+    pub fn ghostty_vt_terminal_get_row_cells(
         terminal: *mut core::ffi::c_void,
         row: u16,
     ) -> ghostty_vt_bytes_t;

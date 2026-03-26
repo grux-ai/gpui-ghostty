@@ -1,4 +1,4 @@
-use ghostty_vt::{CursorInfo, Error, Rgb, Terminal};
+use ghostty_vt::{CursorInfo, Error, PackedCell, Rgb, Terminal};
 
 use crate::TerminalConfig;
 
@@ -174,6 +174,10 @@ impl TerminalSession {
 
     pub fn dump_viewport_row(&self, row: u16) -> Result<String, Error> {
         self.terminal.dump_viewport_row(row)
+    }
+
+    pub fn get_row_cells(&self, row: u16) -> Result<Vec<PackedCell>, Error> {
+        self.terminal.get_row_cells(row)
     }
 
     pub fn dump_viewport_row_cell_styles(
