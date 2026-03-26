@@ -1,11 +1,11 @@
 use super::TerminalSession;
-use ghostty_vt::{KeyModifiers, Rgb, StyleRun, encode_key_named};
+use ghostty_vt::{CursorShape, KeyModifiers, Rgb, StyleRun, encode_key_named};
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
+    App, BorderStyle, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
     EntityInputHandler, FocusHandle, GlobalElementId, IntoElement, KeyBinding, KeyDownEvent,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Render,
     ScrollDelta, ScrollWheelEvent, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, actions, div, fill, hsla, point, prelude::*, px, relative, rgba, size,
+    Window, actions, div, fill, hsla, outline, point, prelude::*, px, relative, rgba, size,
 };
 use std::ops::Range;
 use std::sync::Once;
@@ -1359,7 +1359,7 @@ fn cursor_color_for_background(background: Rgb) -> gpui::Hsla {
     } else {
         gpui::white()
     };
-    cursor.a = 0.72;
+    cursor.a = 0.9;
     cursor
 }
 
@@ -1949,24 +1949,46 @@ impl Element for TerminalTextElement {
 
         let cursor = {
             let view = self.view.read(cx);
-            view.focus_handle
-                .is_focused(window)
-                .then(|| view.session.cursor_position())
-                .flatten()
+            let info = view.session.cursor_info();
+            let focused = view.focus_handle.is_focused(window);
+            if info.visible { Some((info, focused)) } else { None }
         }
-        .and_then(|(col, row)| {
+        .and_then(|(info, focused)| {
+            let cw = cell_width?;
             let background = { self.view.read(cx).session.default_background() };
             let cursor_color = cursor_color_for_background(background);
-            let y = bounds.top() + line_height * (row.saturating_sub(1)) as f32;
-            let row_index = row.saturating_sub(1) as usize;
+            let y = bounds.top() + line_height * (info.row.saturating_sub(1)) as f32;
+            let row_index = info.row.saturating_sub(1) as usize;
             let line = shaped_lines.get(row_index)?;
-            let byte_index = byte_index_for_column_in_line(line.text.as_str(), col);
+            let byte_index = byte_index_for_column_in_line(line.text.as_str(), info.col);
             let x = bounds.left() + line.x_for_index(byte_index.min(line.text.len()));
+            let cell_bounds = Bounds::new(point(x, y), size(cw, line_height));
 
-            Some(fill(
-                Bounds::new(point(x, y), size(px(2.0), line_height)),
-                cursor_color,
-            ))
+            if !focused {
+                return Some(outline(cell_bounds, cursor_color, BorderStyle::Solid));
+            }
+
+            match info.shape {
+                CursorShape::BlockBlink | CursorShape::BlockSteady => {
+                    let mut color = cursor_color;
+                    color.a = 1.0;
+                    Some(fill(cell_bounds, color))
+                }
+                CursorShape::UnderlineBlink | CursorShape::UnderlineSteady => {
+                    let underline_h = px(2.0);
+                    let underline_bounds = Bounds::new(
+                        point(x, y + line_height - underline_h),
+                        size(cw, underline_h),
+                    );
+                    Some(fill(underline_bounds, cursor_color))
+                }
+                CursorShape::BarBlink | CursorShape::BarSteady => {
+                    Some(fill(
+                        Bounds::new(point(x, y), size(px(2.0), line_height)),
+                        cursor_color,
+                    ))
+                }
+            }
         });
 
         TerminalPrepaintState {
