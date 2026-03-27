@@ -23,6 +23,10 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+pub fn mode_new(value: u16, ansi: bool) -> GhosttyMode {
+    (value & 0x7FFF) | ((ansi as u16) << 15)
+}
+
 fn check(result: GhosttyResult) -> Result<(), Error> {
     match result {
         GHOSTTY_SUCCESS => Ok(()),
