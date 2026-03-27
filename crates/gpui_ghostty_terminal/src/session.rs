@@ -106,11 +106,11 @@ impl TerminalSession {
         &self.terminal
     }
 
-    pub fn render_state(&self) -> &RenderState {
-        &self.render_state
+    pub fn render_state(&mut self) -> &mut RenderState {
+        &mut self.render_state
     }
 
-    pub fn update_render_state(&self) {
+    pub fn update_render_state(&mut self) {
         let _ = self.render_state.update(&self.terminal);
     }
 

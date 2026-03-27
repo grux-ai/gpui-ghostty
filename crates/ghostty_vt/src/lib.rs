@@ -501,12 +501,12 @@ impl RenderState {
         }
     }
 
-    pub fn begin_row_iteration(&self) {
+    pub fn begin_row_iteration(&mut self) {
         let _ = unsafe {
             ghostty_render_state_get(
                 self.state,
                 GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
-                self.row_iter as *mut c_void,
+                &mut self.row_iter as *mut GhosttyRenderStateRowIterator as *mut c_void,
             )
         };
     }
@@ -538,12 +538,12 @@ impl RenderState {
         };
     }
 
-    pub fn begin_cell_iteration(&self) {
+    pub fn begin_cell_iteration(&mut self) {
         let _ = unsafe {
             ghostty_render_state_row_get(
                 self.row_iter,
                 GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
-                self.cells as *mut c_void,
+                &mut self.cells as *mut GhosttyRenderStateRowCells as *mut c_void,
             )
         };
     }
