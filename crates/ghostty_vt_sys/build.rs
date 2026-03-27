@@ -15,19 +15,7 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
-        manifest_dir.join("include/ghostty_vt.h").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest_dir.join("zig/build.zig").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest_dir.join("zig/build.zig.zon").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest_dir.join("zig/lib.zig").display()
+        ghostty_dir.join("build.zig").display()
     );
 
     if !ghostty_dir.exists() {
@@ -37,20 +25,17 @@ fn main() {
     }
 
     let zig = find_zig(workspace_root);
-    let zig_version = Command::new(&zig).arg("version").output().ok();
-    if zig_version.is_none() {
-        panic!(
-            "`zig` is required; run `./scripts/bootstrap-zig.sh` \
-to install Zig 0.14.1 into .context/zig/zig"
-        );
+    if Command::new(&zig).arg("version").output().is_err() {
+        panic!("`zig` 0.15.2+ is required on PATH or set ZIG env var");
     }
 
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    let prefix = out_dir.join("zig-out");
+    let prefix = out_dir.join("ghostty-vt-out");
 
     let status = Command::new(&zig)
-        .current_dir(manifest_dir.join("zig"))
+        .current_dir(&ghostty_dir)
         .arg("build")
+        .arg("-Demit-lib-vt=true")
         .arg("-Doptimize=ReleaseFast")
         .arg("--prefix")
         .arg(&prefix)
@@ -64,7 +49,7 @@ to install Zig 0.14.1 into .context/zig/zig"
         "cargo:rustc-link-search=native={}",
         prefix.join("lib").display()
     );
-    println!("cargo:rustc-link-lib=static=ghostty_vt");
+    println!("cargo:rustc-link-lib=static=ghostty-vt");
     println!("cargo:rustc-link-lib=c");
 }
 
