@@ -147,6 +147,36 @@ impl std::fmt::Debug for GhosttyStyleColorValue {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyDeviceAttributesPrimary {
+    pub conformance_level: u16,
+    pub features: [u16; 64],
+    pub num_features: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyDeviceAttributesSecondary {
+    pub device_type: u16,
+    pub firmware_version: u16,
+    pub rom_cartridge: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyDeviceAttributesTertiary {
+    pub unit_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GhosttyDeviceAttributes {
+    pub primary: GhosttyDeviceAttributesPrimary,
+    pub secondary: GhosttyDeviceAttributesSecondary,
+    pub tertiary: GhosttyDeviceAttributesTertiary,
+}
+
 pub const GHOSTTY_STYLE_COLOR_NONE: u32 = 0;
 pub const GHOSTTY_STYLE_COLOR_PALETTE: u32 = 1;
 pub const GHOSTTY_STYLE_COLOR_RGB: u32 = 2;

@@ -59,6 +59,16 @@ unsafe extern "C" fn device_attributes_callback(
     if out_attrs.is_null() {
         return false;
     }
+    unsafe {
+        let attrs = &mut *(out_attrs as *mut ghostty_vt_sys::GhosttyDeviceAttributes);
+        attrs.primary.conformance_level = 62;
+        attrs.primary.features[0] = 22;
+        attrs.primary.num_features = 1;
+        attrs.secondary.device_type = 1;
+        attrs.secondary.firmware_version = 10;
+        attrs.secondary.rom_cartridge = 0;
+        attrs.tertiary.unit_id = 0;
+    }
     true
 }
 
