@@ -1810,7 +1810,6 @@ dependencies = [
 name = "gpui_ghostty_terminal"
 version = "0.1.0"
 dependencies = [
- "base64",
  "ghostty_vt",
  "ghostty_vt_sys",
  "gpui",
