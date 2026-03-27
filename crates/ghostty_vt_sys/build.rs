@@ -37,6 +37,7 @@ fn main() {
         .arg("build")
         .arg("-Demit-lib-vt=true")
         .arg("-Doptimize=ReleaseFast")
+        .arg("-Dsimd=false")
         .arg("--prefix")
         .arg(&prefix)
         .status()
@@ -51,6 +52,11 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=static=ghostty-vt");
     println!("cargo:rustc-link-lib=c");
+    if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-lib=c++");
+    } else {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
 }
 
 fn find_zig(workspace_root: &std::path::Path) -> PathBuf {

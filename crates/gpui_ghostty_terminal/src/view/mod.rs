@@ -1,5 +1,5 @@
 use super::TerminalSession;
-use ghostty_vt::{CursorShape, KeyAction, KeyModifiers, Rgb, StyleRun};
+use ghostty_vt::{CursorVisualStyle, Rgb};
 use gpui::{
     App, BorderStyle, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
     EntityInputHandler, FocusHandle, GlobalElementId, IntoElement, KeyBinding, KeyDownEvent,
@@ -9,6 +9,25 @@ use gpui::{
 };
 use std::ops::Range;
 use std::sync::Once;
+
+fn style_to_flags(s: &ghostty_vt::CellStyle) -> u8 {
+    let mut f: u8 = 0;
+    if s.bold { f |= 0x02; }
+    if s.italic { f |= 0x04; }
+    if s.underline != 0 { f |= 0x08; }
+    if s.faint { f |= 0x10; }
+    if s.strikethrough { f |= 0x40; }
+    f
+}
+
+#[derive(Clone, Debug)]
+struct StyleRun {
+    start_col: u16,
+    end_col: u16,
+    fg: Rgb,
+    bg: Rgb,
+    flags: u8,
+}
 
 actions!(terminal_view, [Copy, Paste, SelectAll, Tab, TabPrev]);
 
@@ -59,33 +78,6 @@ pub(crate) fn should_skip_key_down_for_ime(has_input: bool, keystroke: &gpui::Ke
         keystroke.key.as_str(),
         "enter" | "return" | "kp_enter" | "numpad_enter"
     )
-}
-
-pub(crate) fn ctrl_byte_for_keystroke(keystroke: &gpui::Keystroke) -> Option<u8> {
-    let candidate = keystroke
-        .key_char
-        .as_deref()
-        .or_else(|| (!keystroke.key.is_empty()).then_some(keystroke.key.as_str()))?;
-
-    if candidate == "space" {
-        return Some(0x00);
-    }
-
-    let bytes = candidate.as_bytes();
-    if bytes.len() != 1 {
-        return None;
-    }
-
-    let b = bytes[0];
-    if (b'@'..=b'_').contains(&b) {
-        Some(b & 0x1f)
-    } else if b.is_ascii_lowercase() {
-        Some(b - b'a' + 1)
-    } else if b.is_ascii_uppercase() {
-        Some(b - b'A' + 1)
-    } else {
-        None
-    }
 }
 
 pub(crate) fn sgr_mouse_button_value(
@@ -458,91 +450,13 @@ impl TerminalView {
     }
 
     fn feed_output_bytes_to_session(&mut self, bytes: &[u8]) {
-        if let Some(input) = self.input.as_ref() {
-            let _ = self
-                .session
-                .feed_with_pty_responses(bytes, |resp| input.send(resp));
-        } else {
-            let _ = self.session.feed(bytes);
-        }
+        self.session.vt_write(bytes);
     }
 
-    fn sync_viewport_scroll_tracking(&mut self) {
-        let _ = self.session.take_viewport_scroll_delta();
-    }
-
-    fn apply_viewport_scroll_delta(&mut self, delta: i32) {
-        if delta == 0 {
-            return;
-        }
-
-        let rows = self.session.rows() as usize;
-        if rows == 0 {
-            return;
-        }
-
-        if self.viewport_lines.len() != rows || self.viewport_style_runs.len() != rows {
-            self.refresh_viewport();
-            return;
-        }
-
-        let delta_abs: usize = delta.unsigned_abs() as usize;
-        if delta_abs == 0 {
-            return;
-        }
-        if delta_abs >= rows {
-            self.refresh_viewport();
-            return;
-        }
-
-        let has_layouts = self.line_layouts.len() == rows;
-
-        if delta > 0 {
-            self.viewport_lines.rotate_left(delta_abs);
-            self.viewport_style_runs.rotate_left(delta_abs);
-            if has_layouts {
-                self.line_layouts.rotate_left(delta_abs);
-            }
-
-            for idx in rows - delta_abs..rows {
-                self.viewport_lines[idx].clear();
-                self.viewport_style_runs[idx].clear();
-                if has_layouts {
-                    self.line_layouts[idx] = None;
-                }
-            }
-
-            let dirty_rows: Vec<u16> = (rows - delta_abs..rows).map(|row| row as u16).collect();
-            let _ = self.apply_dirty_viewport_rows(&dirty_rows);
-            return;
-        }
-
-        self.viewport_lines.rotate_right(delta_abs);
-        self.viewport_style_runs.rotate_right(delta_abs);
-        if has_layouts {
-            self.line_layouts.rotate_right(delta_abs);
-        }
-
-        for idx in 0..delta_abs {
-            self.viewport_lines[idx].clear();
-            self.viewport_style_runs[idx].clear();
-            if has_layouts {
-                self.line_layouts[idx] = None;
-            }
-        }
-
-        let dirty_rows: Vec<u16> = (0..delta_abs).map(|row| row as u16).collect();
-        let _ = self.apply_dirty_viewport_rows(&dirty_rows);
-    }
+    fn sync_viewport_scroll_tracking(&mut self) {}
 
     fn reconcile_dirty_viewport_after_output(&mut self) {
-        let delta = self.session.take_viewport_scroll_delta();
-        self.apply_viewport_scroll_delta(delta);
-
-        let dirty = self.session.take_dirty_viewport_rows();
-        if !dirty.is_empty() && !self.apply_dirty_viewport_rows(&dirty) {
-            self.pending_refresh = true;
-        }
+        self.refresh_viewport();
     }
 
     fn with_refreshed_viewport(mut self) -> Self {
@@ -551,44 +465,62 @@ impl TerminalView {
     }
 
     fn refresh_viewport(&mut self) {
-        let rows = self.session.rows();
-        let mut lines = Vec::with_capacity(rows as usize);
-        let mut style_runs = Vec::with_capacity(rows as usize);
+        self.session.update_render_state();
+        let rs = self.session.render_state();
+        let default_fg = rs.foreground();
+        let default_bg = rs.background();
 
-        for row in 0..rows {
-            let cells = self.session.get_row_cells(row).unwrap_or_default();
-            let (line, runs) = Self::build_line_from_cells(&cells);
-            lines.push(line);
-            style_runs.push(runs);
-        }
+        let mut lines = Vec::new();
+        let mut style_runs = Vec::new();
+        let mut grapheme_buf: Vec<u32> = Vec::new();
 
-        self.viewport_line_offsets = Self::compute_viewport_line_offsets(&lines);
-        self.viewport_total_len = Self::compute_viewport_total_len(&lines);
-        self.viewport_lines = lines;
-        self.viewport_style_runs = style_runs;
-        self.line_layouts.clear();
-        self.line_layout_key = None;
-        self.selection = None;
-    }
+        rs.begin_row_iteration();
+        while rs.next_row() {
+            let mut text = String::new();
+            let mut runs: Vec<StyleRun> = Vec::new();
+            let mut col: u16 = 1;
+            let mut run_start: u16 = 1;
+            let mut run_fg = default_fg;
+            let mut run_bg = default_bg;
+            let mut run_flags: u8 = 0;
+            let mut has_run = false;
 
-    fn build_line_from_cells(cells: &[ghostty_vt::PackedCell]) -> (String, Vec<StyleRun>) {
-        let mut text = String::with_capacity(cells.len());
-        let mut runs: Vec<StyleRun> = Vec::new();
+            rs.begin_cell_iteration();
+            while rs.next_cell() {
+                let fg = rs.cell_fg().unwrap_or(default_fg);
+                let bg = rs.cell_bg().unwrap_or(default_bg);
+                let style = rs.cell_style();
+                let flags = style_to_flags(&style);
 
-        let mut run_start: u16 = 1;
-        let mut run_fg = ghostty_vt::Rgb { r: 0, g: 0, b: 0 };
-        let mut run_bg = ghostty_vt::Rgb { r: 0, g: 0, b: 0 };
-        let mut run_flags: u8 = 0;
-        let mut has_run = false;
+                if has_run && (fg != run_fg || bg != run_bg || flags != run_flags) {
+                    runs.push(StyleRun {
+                        start_col: run_start,
+                        end_col: col - 1,
+                        fg: run_fg,
+                        bg: run_bg,
+                        flags: run_flags,
+                    });
+                    run_start = col;
+                }
+                run_fg = fg;
+                run_bg = bg;
+                run_flags = flags;
+                has_run = true;
 
-        for (i, cell) in cells.iter().enumerate() {
-            if cell.wide == 2 || cell.wide == 3 {
-                continue;
+                let n = rs.cell_graphemes(&mut grapheme_buf);
+                if n == 0 {
+                    text.push(' ');
+                } else {
+                    for &cp in &grapheme_buf[..n] {
+                        if let Some(ch) = char::from_u32(cp) {
+                            text.push(ch);
+                        }
+                    }
+                }
+                col += 1;
             }
 
-            let col = (i as u16) + 1;
-
-            if has_run && (cell.fg != run_fg || cell.bg != run_bg || cell.flags != run_flags) {
+            if has_run {
                 runs.push(StyleRun {
                     start_col: run_start,
                     end_col: col - 1,
@@ -596,35 +528,21 @@ impl TerminalView {
                     bg: run_bg,
                     flags: run_flags,
                 });
-                run_start = col;
             }
 
-            run_fg = cell.fg;
-            run_bg = cell.bg;
-            run_flags = cell.flags;
-            has_run = true;
-
-            if cell.codepoint == 0 || cell.codepoint == b' ' as u32 {
-                text.push(' ');
-            } else if let Some(ch) = char::from_u32(cell.codepoint) {
-                text.push(ch);
-            } else {
-                text.push(' ');
-            }
+            rs.clear_row_dirty();
+            lines.push(text);
+            style_runs.push(runs);
         }
 
-        if has_run {
-            let last_col = cells.len() as u16;
-            runs.push(StyleRun {
-                start_col: run_start,
-                end_col: last_col,
-                fg: run_fg,
-                bg: run_bg,
-                flags: run_flags,
-            });
-        }
-
-        (text, runs)
+        rs.clear_dirty();
+        self.viewport_line_offsets = Self::compute_viewport_line_offsets(&lines);
+        self.viewport_total_len = Self::compute_viewport_total_len(&lines);
+        self.viewport_lines = lines;
+        self.viewport_style_runs = style_runs;
+        self.line_layouts.clear();
+        self.line_layout_key = None;
+        self.selection = None;
     }
 
     fn compute_viewport_line_offsets(lines: &[String]) -> Vec<usize> {
@@ -705,49 +623,6 @@ impl TerminalView {
             .saturating_sub(line_start)
             .min(line.len().saturating_sub(1));
         url_at_byte_index(line, local)
-    }
-
-    fn apply_dirty_viewport_rows(&mut self, dirty_rows: &[u16]) -> bool {
-        if dirty_rows.is_empty() {
-            return false;
-        }
-
-        let expected_rows = self.session.rows() as usize;
-        if self.viewport_lines.len() != expected_rows {
-            self.refresh_viewport();
-            return true;
-        }
-        if self.viewport_style_runs.len() != expected_rows {
-            self.refresh_viewport();
-            return true;
-        }
-
-        for &row in dirty_rows {
-            let row_idx = row as usize;
-            if row_idx >= self.viewport_lines.len() {
-                continue;
-            }
-
-            let cells = match self.session.get_row_cells(row) {
-                Ok(c) => c,
-                Err(_) => {
-                    self.refresh_viewport();
-                    return true;
-                }
-            };
-
-            let (line, runs) = Self::build_line_from_cells(&cells);
-            self.viewport_lines[row_idx] = line;
-            self.viewport_style_runs[row_idx] = runs;
-            if row_idx < self.line_layouts.len() {
-                self.line_layouts[row_idx] = None;
-            }
-        }
-
-        self.viewport_line_offsets = Self::compute_viewport_line_offsets(&self.viewport_lines);
-        self.viewport_total_len = Self::compute_viewport_total_len(&self.viewport_lines);
-        self.selection = None;
-        true
     }
 
     fn schedule_viewport_refresh(&mut self, cx: &mut Context<Self>) {
@@ -1090,20 +965,17 @@ impl TerminalView {
             return;
         }
 
-        let modifiers = KeyModifiers {
-            shift: keystroke.modifiers.shift,
-            control: keystroke.modifiers.control,
-            alt: keystroke.modifiers.alt,
-            super_key: false,
-        };
-        let action = if event.is_held {
-            KeyAction::Repeat
-        } else {
-            KeyAction::Press
-        };
         let utf8 = keystroke.key_char.as_deref().unwrap_or("");
+        let is_repeat = event.is_held;
 
-        if let Some(encoded) = self.session.encode_key(&keystroke.key, utf8, modifiers, action) {
+        if let Some(encoded) = self.session.encode_key(
+            &keystroke.key,
+            utf8,
+            keystroke.modifiers.shift,
+            keystroke.modifiers.control,
+            keystroke.modifiers.alt,
+            is_repeat,
+        ) {
             if let Some(input) = self.input.as_ref() {
                 input.send(&encoded);
             } else {
@@ -1972,16 +1844,21 @@ impl Element for TerminalTextElement {
             let view = self.view.read(cx);
             let info = view.session.cursor_info();
             let focused = view.focus_handle.is_focused(window);
-            if info.visible { Some((info, focused)) } else { None }
+            if info.visible && info.in_viewport {
+                Some((info, focused))
+            } else {
+                None
+            }
         }
         .and_then(|(info, focused)| {
             let cw = cell_width?;
             let background = { self.view.read(cx).session.default_background() };
             let cursor_color = cursor_color_for_background(background);
-            let y = bounds.top() + line_height * (info.row.saturating_sub(1)) as f32;
-            let row_index = info.row.saturating_sub(1) as usize;
+            let y = bounds.top() + line_height * info.y as f32;
+            let row_index = info.y as usize;
             let line = shaped_lines.get(row_index)?;
-            let byte_index = byte_index_for_column_in_line(line.text.as_str(), info.col);
+            let byte_index =
+                byte_index_for_column_in_line(line.text.as_str(), info.x.saturating_add(1));
             let x = bounds.left() + line.x_for_index(byte_index.min(line.text.len()));
             let cell_bounds = Bounds::new(point(x, y), size(cw, line_height));
 
@@ -1989,13 +1866,16 @@ impl Element for TerminalTextElement {
                 return Some(outline(cell_bounds, cursor_color, BorderStyle::Solid));
             }
 
-            match info.shape {
-                CursorShape::BlockBlink | CursorShape::BlockSteady => {
+            match info.style {
+                CursorVisualStyle::Block => {
                     let mut color = cursor_color;
                     color.a = 1.0;
                     Some(fill(cell_bounds, color))
                 }
-                CursorShape::UnderlineBlink | CursorShape::UnderlineSteady => {
+                CursorVisualStyle::BlockHollow => {
+                    Some(outline(cell_bounds, cursor_color, BorderStyle::Solid))
+                }
+                CursorVisualStyle::Underline => {
                     let underline_h = px(2.0);
                     let underline_bounds = Bounds::new(
                         point(x, y + line_height - underline_h),
@@ -2003,12 +1883,10 @@ impl Element for TerminalTextElement {
                     );
                     Some(fill(underline_bounds, cursor_color))
                 }
-                CursorShape::BarBlink | CursorShape::BarSteady => {
-                    Some(fill(
-                        Bounds::new(point(x, y), size(px(2.0), line_height)),
-                        cursor_color,
-                    ))
-                }
+                CursorVisualStyle::Bar => Some(fill(
+                    Bounds::new(point(x, y), size(px(2.0), line_height)),
+                    cursor_color,
+                )),
             }
         });
 

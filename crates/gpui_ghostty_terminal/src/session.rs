@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
-use ghostty_vt::{CursorVisualStyle, Error, KeyEncoder, RenderState, Rgb, Terminal};
+use ghostty_vt::{Error, KeyEncoder, RenderState, Rgb, Terminal};
 
 use crate::TerminalConfig;
 
@@ -27,11 +27,13 @@ unsafe extern "C" fn write_pty_callback(
     if userdata.is_null() || data.is_null() || len == 0 {
         return;
     }
-    let ud = &*(userdata as *const SessionUserdata);
-    if let Some(ref writer) = ud.pty_writer {
-        if let Ok(mut w) = writer.lock() {
-            let _ = std::io::Write::write_all(&mut *w, std::slice::from_raw_parts(data, len));
-            let _ = std::io::Write::flush(&mut *w);
+    unsafe {
+        let ud = &*(userdata as *const SessionUserdata);
+        if let Some(ref writer) = ud.pty_writer {
+            if let Ok(mut w) = writer.lock() {
+                let _ = std::io::Write::write_all(&mut *w, std::slice::from_raw_parts(data, len));
+                let _ = std::io::Write::flush(&mut *w);
+            }
         }
     }
 }
@@ -43,8 +45,10 @@ unsafe extern "C" fn title_changed_callback(
     if userdata.is_null() {
         return;
     }
-    let ud = &mut *(userdata as *mut SessionUserdata);
-    ud.title_changed = true;
+    unsafe {
+        let ud = &mut *(userdata as *mut SessionUserdata);
+        ud.title_changed = true;
+    }
 }
 
 unsafe extern "C" fn device_attributes_callback(

@@ -8,6 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 base64 = "0.22"
 ghostty_vt = { path = "../ghostty_vt" }
+ghostty_vt_sys = { path = "../ghostty_vt_sys" }
 gpui = { workspace = true }
 smallvec = { workspace = true }
 unicode-width = "0.2"
